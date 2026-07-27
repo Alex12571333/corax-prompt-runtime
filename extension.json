@@ -1,0 +1,44 @@
+{
+  "schema_version": "1.0",
+  "id": "prompts.runtime",
+  "kind": "runtime_service",
+  "name": "Corax Prompt Runtime",
+  "description": "Cache-stable layered Markdown prompt assembly.",
+  "version": "0.1.0",
+  "author": "Corax",
+  "license": "MIT",
+  "homepage": "https://github.com/Alex12571333/corax-prompt-runtime",
+  "tags": ["prompts", "cache", "identity", "memory"],
+  "interfaces": ["agent.service/v1", "agent.prompts/v1"],
+  "exposure": "runtime",
+  "entrypoint": "corax_prompt_runtime:PromptRuntime",
+  "dependencies": [],
+  "security": {
+    "permission_level": "safe",
+    "required_scopes": [],
+    "risk_level": "low",
+    "side_effects": ["write_file", "memory_write"],
+    "secrets": []
+  },
+  "schemas": {
+    "config": {
+      "type": "object",
+      "properties": {
+        "enabled": {"type": "boolean"},
+        "root": {"type": "string"},
+        "user_profile": {"type": "string"},
+        "working_memory": {"type": "string"},
+        "max_profile_chars": {"type": "integer", "minimum": 256},
+        "max_working_memory_chars": {"type": "integer", "minimum": 256},
+        "max_layer_chars": {"type": "integer", "minimum": 1024},
+        "max_total_prompt_chars": {"type": "integer", "minimum": 4096}
+      }
+    },
+    "input": {},
+    "output": {}
+  },
+  "compatibility": {
+    "min_core_version": "0.2.0",
+    "sdk_version": "0.2.0"
+  }
+}
