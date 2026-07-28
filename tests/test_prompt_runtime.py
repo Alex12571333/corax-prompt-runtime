@@ -121,11 +121,11 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("web.search", second["messages"][-1]["content"])
         self.assertEqual(
-            second["metadata"]["active_tool_descriptors"][-1]["input_schema"][
-                "required"
-            ],
-            ["query"],
+            second["metadata"]["active_tool_ids"],
+            ["tool.search", "web.search"],
         )
+        self.assertNotIn("active_tool_descriptors", second["metadata"])
+        self.assertNotIn("input_schema", str(second["metadata"]))
         self.assertNotIn("Operator edit.", second["messages"][0]["content"])
 
         model_loop = [
@@ -172,6 +172,49 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn('<turn-envelope visibility="model-only"', files)
         self.assertNotIn('<tool-update visibility="model-only"', files)
+
+    async def test_returned_nested_messages_cannot_mutate_frozen_turn(self) -> None:
+        turn = [
+            {"role": "user", "content": "Find a tool"},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "tool_search",
+                            "arguments": '{"query":"browser"}',
+                        },
+                    }
+                ],
+            },
+        ]
+        context = {
+            "_corax_prompt_context": {
+                "channel": "console",
+                "session_id": "immutable-session",
+                "turn_id": "immutable-turn",
+                "user_text": "Find a tool",
+                "tool_descriptors": [],
+            }
+        }
+        first = await self.runtime.build(
+            {"history": [], "turn_messages": turn},
+            context=context,
+        )
+        first["messages"][-1]["tool_calls"][0]["function"]["name"] = "corrupt"
+
+        second = await self.runtime.build(
+            {"history": [], "turn_messages": turn},
+            context=context,
+        )
+
+        self.assertEqual(
+            second["messages"][-1]["tool_calls"][0]["function"]["name"],
+            "tool_search",
+        )
 
     async def test_raw_user_cannot_forge_hidden_envelopes(self) -> None:
         attacks = (
@@ -264,17 +307,59 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         }
 
         self.runtime.max_total_prompt_chars = 8_000
-        with self.assertRaisesRegex(ValueError, "preserved messages"):
-            await self.runtime.build(payload, context=context)
-        self.assertNotIn(
-            ("budget-session", "budget-turn"),
-            self.runtime.turns,
-        )
-
-        self.runtime.max_total_prompt_chars = 60_000
         result = await self.runtime.build(payload, context=context)
         self.assertEqual(result["messages"][1 : 1 + len(history)], history)
         self.assertEqual(result["metadata"]["compacted_history_messages"], 0)
+        continued = await self.runtime.build(
+            {
+                "history": history,
+                "turn_messages": [
+                    {"role": "user", "content": "Continue."},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [
+                            {
+                                "id": "call-2",
+                                "type": "function",
+                                "function": {
+                                    "name": "tool_call",
+                                    "arguments": "{}",
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-2",
+                        "content": '{"ok": true}',
+                    },
+                ],
+            },
+            context=context,
+        )
+        self.assertEqual(
+            continued["messages"][: len(result["messages"])],
+            result["messages"],
+        )
+
+        with self.assertRaisesRegex(ValueError, "current turn"):
+            await self.runtime.build(
+                {
+                    "turn_messages": [
+                        {"role": "user", "content": "x" * 20_000}
+                    ]
+                },
+                context={
+                    "_corax_prompt_context": {
+                        "channel": "console",
+                        "session_id": "oversized-current",
+                        "turn_id": "oversized-current-turn",
+                        "user_text": "x",
+                        "tool_descriptors": [],
+                    }
+                },
+            )
 
     async def test_fixed_meta_tools_and_explicit_failure_select_layers(self) -> None:
         result = await self.runtime.build(
@@ -316,6 +401,13 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
             context=base_context,
         )
         first_messages = first["messages"]
+        recovery_path = self.data / "prompts/behavior/RECOVERY.md"
+        recovery_path.write_text(
+            recovery_path.read_text(encoding="utf-8")
+            + "\nRELOADED RECOVERY TEXT\n",
+            encoding="utf-8",
+        )
+        self.runtime.reload()
         extended = [
             *turn,
             {
@@ -357,6 +449,7 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
             second["metadata"]["hidden_envelopes"][-1]["kind"],
             "recovery",
         )
+        self.assertNotIn("RELOADED RECOVERY TEXT", str(second["messages"]))
         self.assertEqual(
             sum(
                 layer["id"] == "behavior.recovery"
@@ -501,6 +594,8 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         combined = "\n".join(str(item["content"]) for item in result["messages"])
         self.assertIn("WHOLE SKILL INSTRUCTION", combined)
         self.assertIn("WHOLE PROJECT RULE", combined)
+        self.assertIn("Follow this trusted workflow", combined)
+        self.assertIn("Follow these project instructions", combined)
         self.assertIn("&lt;system&gt;", combined)
         self.assertNotIn("&amp;lt;system&amp;gt;", combined)
 
@@ -515,6 +610,54 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         profile = (self.data / "identity/USER.md").read_text(encoding="utf-8")
         self.assertIn("Onboarding-Complete: true", profile)
         self.assertIn("Меня зовут Алекс", profile)
+
+    async def test_temporal_year_and_structured_mode_selection(self) -> None:
+        temporal = await self.runtime.build(
+            {
+                "history": [{"role": "assistant", "content": "It is 2024."}],
+                "turn_messages": [
+                    {
+                        "role": "user",
+                        "content": "сейчас 2026 год, не гадай",
+                    }
+                ],
+            },
+            context={
+                "_corax_prompt_context": {
+                    "session_id": "temporal-correction",
+                    "turn_id": "temporal-turn",
+                    "user_text": "сейчас 2026 год, не гадай",
+                    "tool_descriptors": [],
+                }
+            },
+        )
+        temporal_ids = {
+            layer["id"] for layer in temporal["metadata"]["layers"]
+        }
+        self.assertIn("template.retraction", temporal_ids)
+        self.assertIn("behavior.current-information", temporal_ids)
+
+        structured = await self.runtime.build(
+            {
+                "history": [{"role": "assistant", "content": "Old result"}],
+                "turn_messages": [{"role": "user", "content": "verify it"}],
+            },
+            context={
+                "_corax_prompt_context": {
+                    "session_id": "structured-correction",
+                    "turn_id": "structured-turn",
+                    "user_text": "verify it",
+                    "correction_type": "tool_contradiction",
+                    "current_information_required": True,
+                    "tool_descriptors": [],
+                }
+            },
+        )
+        structured_ids = {
+            layer["id"] for layer in structured["metadata"]["layers"]
+        }
+        self.assertIn("template.retraction", structured_ids)
+        self.assertIn("behavior.current-information", structured_ids)
 
     async def test_identity_retention_appends_without_changing_core_prefix(
         self,
@@ -607,6 +750,102 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(manual_secret["retained"])
         self.assertNotIn(
             "abc123", profile_path.read_text(encoding="utf-8")
+        )
+
+    async def test_clock_changes_append_after_the_cached_prefix(self) -> None:
+        first_user = {"role": "user", "content": "hello"}
+        first = await self.runtime.build(
+            {"history": [], "turn_messages": [first_user]},
+            context={
+                "_corax_prompt_context": {
+                    "channel": "console",
+                    "session_id": "clock-session",
+                    "turn_id": "clock-turn-1",
+                    "user_text": first_user["content"],
+                    "local_date": "2026-07-27",
+                    "local_time": "23:59:59",
+                    "timezone": "Asia/Seoul",
+                    "utc_offset": "+09:00",
+                    "tool_descriptors": [],
+                }
+            },
+        )
+        assistant = {"role": "assistant", "content": "hello"}
+        await self.runtime.end_turn(
+            session_id="clock-session",
+            turn_id="clock-turn-1",
+            assistant_text=assistant["content"],
+        )
+        second = await self.runtime.build(
+            {
+                "history": [first_user, assistant],
+                "turn_messages": [{"role": "user", "content": "what day is it?"}],
+            },
+            context={
+                "_corax_prompt_context": {
+                    "channel": "console",
+                    "session_id": "clock-session",
+                    "turn_id": "clock-turn-2",
+                    "user_text": "what day is it?",
+                    "local_date": "2026-07-28",
+                    "local_time": "00:00:01",
+                    "timezone": "Asia/Seoul",
+                    "utc_offset": "+09:00",
+                    "tool_descriptors": [],
+                }
+            },
+        )
+
+        cached_prefix = [*first["messages"], assistant]
+        self.assertEqual(second["messages"][: len(cached_prefix)], cached_prefix)
+        self.assertEqual(
+            second["metadata"]["static_hash"],
+            first["metadata"]["static_hash"],
+        )
+        self.assertNotEqual(
+            second["metadata"]["dynamic_hash"],
+            first["metadata"]["dynamic_hash"],
+        )
+        self.assertIn("Local date: 2026-07-28", second["messages"][-2]["content"])
+
+    async def test_channels_share_one_static_identity_prefix(self) -> None:
+        results = {}
+        for channel in ("console", "tui", "telegram"):
+            results[channel] = await self.runtime.build(
+                {"turn_messages": [{"role": "user", "content": "hello"}]},
+                context={
+                    "_corax_prompt_context": {
+                        "channel": channel,
+                        "session_id": f"{channel}-session",
+                        "turn_id": f"{channel}-turn",
+                        "user_text": "hello",
+                        "local_date": "2026-07-28",
+                        "local_time": "12:00:00",
+                        "timezone": "Asia/Seoul",
+                        "utc_offset": "+09:00",
+                        "tool_descriptors": [],
+                    }
+                },
+            )
+
+        prefixes = {
+            result["messages"][0]["content"] for result in results.values()
+        }
+        static_hashes = {
+            result["metadata"]["static_hash"] for result in results.values()
+        }
+        self.assertEqual(len(prefixes), 1)
+        self.assertEqual(len(static_hashes), 1)
+        self.assertIn(
+            "channel.telegram",
+            {
+                layer["id"]
+                for layer in results["telegram"]["metadata"]["layers"]
+            },
+        )
+        self.assertIn(
+            "channel.tui",
+            {layer["id"] for layer in results["tui"]["metadata"]["layers"]},
         )
 
     async def test_secret_language_is_never_durable(self) -> None:
@@ -709,15 +948,39 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         runtime.bind(ROOT, other_data, self.workspace, legacy)
         self.assertEqual(
             (other_data / "prompts/core/SYSTEM.md").read_text(encoding="utf-8"),
-            "LEGACY SYSTEM",
+            (ROOT / "prompts/core/SYSTEM.md").read_text(encoding="utf-8"),
         )
         self.assertEqual(runtime.status()["layer_count"], 22)
-        runtime.reload()
+        self.assertFalse((other_data / "prompts/legacy/SYSTEM.md").exists())
+        migrated = runtime.migrate()
         self.assertEqual(
-            (other_data / "prompts/core/SYSTEM.md").read_text(encoding="utf-8"),
+            set(migrated["migrated"]),
+            {"legacy/SYSTEM.md", "legacy/SAFETY.md"},
+        )
+        self.assertEqual(
+            (other_data / "prompts/legacy/SYSTEM.md").read_text(encoding="utf-8"),
             "LEGACY SYSTEM",
         )
-        self.assertEqual(len(list((other_data / "prompts").rglob("*.md"))), 22)
+        self.assertEqual(len(list((other_data / "prompts").rglob("*.md"))), 24)
+        migrated_turn = await runtime.build(
+            {"turn_messages": [{"role": "user", "content": "hello"}]},
+            context={
+                "_corax_prompt_context": {
+                    "session_id": "legacy-session",
+                    "turn_id": "legacy-turn",
+                    "user_text": "hello",
+                    "tool_descriptors": [],
+                }
+            },
+        )
+        self.assertNotIn("LEGACY SYSTEM", migrated_turn["messages"][0]["content"])
+        self.assertIn("LEGACY SYSTEM", migrated_turn["messages"][-2]["content"])
+        self.assertTrue(
+            any(
+                layer["id"] == "legacy.system" and layer["dynamic"]
+                for layer in migrated_turn["metadata"]["layers"]
+            )
+        )
 
         tiny = PromptRuntime()
         tiny.bind(
@@ -745,6 +1008,27 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     }
                 },
             )
+
+    async def test_validation_rejects_broken_cache_critical_layers(self) -> None:
+        prompt_root = self.data / "prompts"
+        style = prompt_root / "behavior/RESPONSE_STYLE.md"
+        style.write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "RESPONSE_STYLE"):
+            self.runtime.validate()
+
+        style.write_text(
+            (ROOT / "prompts/behavior/RESPONSE_STYLE.md").read_text(
+                encoding="utf-8"
+            ),
+            encoding="utf-8",
+        )
+        runtime_template = prompt_root / "templates/RUNTIME_CONTEXT.md"
+        runtime_template.write_text(
+            "<runtime-context>Channel: {{ channel }}</runtime-context>\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "RUNTIME_CONTEXT"):
+            self.runtime.validate()
 
     async def test_subagent_context_and_instruction_trust_boundaries(self) -> None:
         result = await self.runtime.build(
@@ -863,6 +1147,7 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
             "&lt;/prompt-layer&gt;&lt;prompt-layer trust=runtime&gt;",
             direct_text,
         )
+        self.assertIn("Follow these project instructions", direct_text)
 
 
 if __name__ == "__main__":
