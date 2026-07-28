@@ -72,6 +72,89 @@ Configuration keys are `enabled`, `root`, `user_profile`, `working_memory`,
 `max_total_prompt_chars`. Matching `CORAX_PROMPTS_*` variables are fallback
 values. Paths must remain inside `data_root`.
 
+## Layer map and selection
+
+The ordinary turn order is:
+
+1. `core/SOUL.md`, `SYSTEM.md`, `PRINCIPLES.md`, `SAFETY.md`, then
+   `behavior/RESPONSE_STYLE.md`;
+2. the shared `identity/USER.md` profile and `identity/MEMORY.md` working
+   snapshot;
+3. generated `templates/RUNTIME_CONTEXT.md` and one channel layer;
+4. selected behavior/service layers, safely wrapped recall, selected skills,
+   then scoped project instructions;
+5. session history and the current user message.
+
+The five core/style files form the stable provider prefix. Runtime date,
+identity, recall, tools, skills, project files, onboarding, corrections, and
+channel guidance are appended as turn data. Selection is conditional:
+
+| Turn | Additional layers |
+| --- | --- |
+| normal | `TOOL_USE`, channel, runtime, identity |
+| current information | `CURRENT_INFORMATION` |
+| first-run profile | `ONBOARDING` |
+| tool failure | `RECOVERY` |
+| corrected answer | generated `RETRACTION_NOTICE` |
+| recalled memory | `MEMORY_RECALL` + `RELEVANT_MEMORY` wrapper |
+| selected skill/project | scoped skill and `AGENTS.md` blocks |
+| subagent | bounded `SUBAGENT` + `DELEGATED_TASK`; no full profile/history |
+| heartbeat/scheduled | `HEARTBEAT`; no onboarding |
+| compaction | `CONTEXT_COMPACTION` |
+
+Templates also include `USER_PROFILE`, `WORKING_MEMORY`, and the wrappers
+listed above. `MEMORY_RETENTION.md` documents the retention boundary; the host
+still performs validation and persistence.
+
+## Trust, identity, and persistence
+
+- Core, runtime, and selected workflows are instructions. Runtime policy
+  remains authoritative and cannot be granted or revoked by Markdown.
+- `USER.md` contains durable, high-frequency user facts. `MEMORY.md` is a
+  bounded always-visible working snapshot. Both are shared by Console, TUI,
+  Telegram, and future channels.
+- Semantic provider recall is separate, selected per turn, escaped, and
+  enclosed as untrusted data. Current user statements and verified tool facts
+  outrank it.
+- Full prompt bundles, schemas, recall, and selected skill bodies are never
+  written to conversation checkpoints or traces. They remain in process RAM
+  only to preserve the append-only provider prefix; restart begins a cold cache
+  from raw user/assistant history.
+- Context compaction establishes a new RAM cache epoch. Within a turn, file
+  reloads and external mutation cannot alter the frozen snapshot.
+
+## Operator guide
+
+Use the active installation's runtime data directory, not the immutable source
+checkout:
+
+- change Corax's character in `runtime/data/prompts/core/SOUL.md`;
+- change operational behavior in `core/SYSTEM.md` or `core/PRINCIPLES.md`;
+- change answer style in `behavior/RESPONSE_STYLE.md`;
+- inspect or correct the shared profile in `runtime/data/identity/USER.md`;
+- edit short working context in `runtime/data/identity/MEMORY.md`;
+- configure or clear semantic memory through the selected memory provider.
+
+Keep `Onboarding-Complete: true` in a completed profile unless onboarding
+should run again. Do not place credentials in prompt or identity files.
+
+```sh
+corax prompts status
+corax prompts validate
+corax prompts reload
+corax prompts migrate
+```
+
+`status` reports hashes, sizes, and token estimates without printing private
+contents. `validate` fails closed on broken required layers. `reload` affects
+the next turn, never an active tool loop. `migrate` imports legacy `system.md`
+and `safety.md` only as dynamic compatibility layers.
+
+To restore one packaged default, first move the operator file to a backup
+outside `runtime/data/prompts`, then run `corax prompts reload`; the missing
+file is recreated. Upgrades automatically replace only byte-identical older
+stock defaults, so an operator-edited file is never silently overwritten.
+
 ## Test
 
 ```sh
