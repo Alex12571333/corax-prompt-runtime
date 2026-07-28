@@ -181,6 +181,24 @@ _STOCK_DEFAULT_HASHES = {
         "dfbfb2602fe8231f97031a785999641de271080c991a0470fa3804318cd279e0"
     },
 }
+_LEGACY_STOCK_HASHES = {
+    "legacy/SYSTEM.md": {
+        "0f9518f341886856f87adfbd47ca65c189acacfe4d03766d4d428adbafae1413",
+        "33f7dfdb685f3211bfc44c70d9889b135b4688dc0d6ededd2905c9fccd74ead3",
+        "96283e13af1ae2a79d5e8aa2a6b3a85f40f6f1d10c3b6916ae01584bd6003de8",
+        "9eafe3f7134f0ecccd4e1fc274ec073e3c7e15423bfea985e60b36aa62160deb",
+        "394c974174420a3f2155b9ebf6f1327b02277102b44afbad9db5d3c8a73b904f",
+        "36db8c3d4e2022b2aa52e0c4a082a596436fe8750469f44e06da95e17346ae5e",
+        "c85be316aedb7bc2725f701ef72d411da8b451d89e032415cd7f3e2288be1e94",
+        "d28e19e20716080c2027218dbfca2c3df26dc5c160b39e94af66551d21967dd8",
+    },
+    "legacy/SAFETY.md": {
+        "eb944976b27d15407f998119f3783220ab6bb295625be9dd2ce611a4e306626d",
+        "93ee971f390fc7520c2af4f9d8c4553b59a3a56b39bb2fd7e58026f68fb4ab6b",
+        "fac4efec1f708b333523e05e76700e26d80fe9fcae9359d5acbd98cdff632248",
+        "e9764d124e6f2fe260ce3b5b7a0405487abb2269be24685509661fa4f9d1d8dc",
+    },
+}
 
 
 def _digest(value: str) -> str:
@@ -360,7 +378,7 @@ class PromptBuilder:
     id="prompts.runtime",
     name="Corax Prompt Runtime",
     description="Cache-stable layered Markdown prompt assembly.",
-    version="0.1.2",
+    version="0.1.3",
     author="Corax",
     license="MIT",
     homepage="https://github.com/Alex12571333/corax-prompt-runtime",
@@ -474,6 +492,11 @@ class PromptRuntime(RuntimeService):
                 continue
             try:
                 content = self._read_file(path, self.max_layer_chars, self.prompt_root)
+                if (
+                    relative in _LEGACY_FILES
+                    and _digest(content) in _LEGACY_STOCK_HASHES.get(relative, set())
+                ):
+                    continue
                 if relative in _REQUIRED_FILES and not content.strip():
                     raise ValueError("required prompt layer is empty")
                 variables = set(_VARIABLE.findall(content))
@@ -511,10 +534,15 @@ class PromptRuntime(RuntimeService):
         """Run supported legacy migrations without replacing any target."""
 
         self._require_bound()
-        migrated = self._migrate_legacy()
+        skipped_stock: list[str] = []
+        migrated = self._migrate_legacy(skipped_stock=skipped_stock)
         self.last_migrations = migrated
         self.reload()
-        return {"migrated": migrated, "status": self.status()}
+        return {
+            "migrated": migrated,
+            "skipped_stock": skipped_stock,
+            "status": self.status(),
+        }
 
     def status(self) -> dict[str, Any]:
         sources = []
@@ -903,6 +931,87 @@ class PromptRuntime(RuntimeService):
             "profile_chars": len(candidate),
         }
 
+    def identity(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Inspect or atomically replace one bounded operator identity file."""
+
+        self._require_bound()
+        assert self.data_root is not None
+        assert self.user_profile_path is not None
+        assert self.working_memory_path is not None
+        target = str(payload.get("target") or "").strip().lower()
+        action = str(payload.get("action") or "status").strip().lower()
+        if target == "profile":
+            path = self.user_profile_path
+            limit = self.max_profile_chars
+            reset_content = (
+                "# User profile\n\n"
+                "Onboarding-Complete: false\n\n"
+                "## Durable facts\n"
+            )
+        elif target == "memory":
+            path = self.working_memory_path
+            limit = self.max_working_memory_chars
+            reset_content = "# Working memory\n"
+        else:
+            raise ValueError("identity target must be profile or memory")
+        if action not in {"status", "show", "replace", "reset", "onboarding"}:
+            raise ValueError(
+                "identity action must be status, show, replace, reset or onboarding"
+            )
+        if action == "onboarding" and target != "profile":
+            raise ValueError("onboarding action requires the profile target")
+
+        current = (
+            self._read_file(path, limit, self.data_root)
+            if path.is_file()
+            else ""
+        )
+        if action == "replace":
+            content = payload.get("content")
+            if not isinstance(content, str):
+                raise TypeError("identity replacement content must be a string")
+            if "\x00" in content:
+                raise ValueError("identity content contains a NUL byte")
+            if len(content) > limit:
+                raise ValueError(
+                    f"{target} identity exceeds its {limit}-character limit"
+                )
+            _atomic_write(path, content)
+            current = content
+        elif action == "reset":
+            _atomic_write(path, reset_content)
+            current = reset_content
+        elif action == "onboarding":
+            if re.search(r"(?im)^Onboarding-Complete:\s*(?:true|false)\s*$", current):
+                current = re.sub(
+                    r"(?im)^Onboarding-Complete:\s*(?:true|false)\s*$",
+                    "Onboarding-Complete: false",
+                    current,
+                )
+            else:
+                current = "Onboarding-Complete: false\n\n" + current
+            _atomic_write(path, current)
+
+        result = {
+            "target": target,
+            "path": str(path),
+            "exists": path.is_file(),
+            "chars": len(current),
+            "max_chars": limit,
+            "hash": _digest(current),
+            "applies_to": "future turns",
+        }
+        if target == "profile":
+            result["onboarding_complete"] = bool(
+                re.search(
+                    r"(?im)^Onboarding-Complete:\s*true\s*$",
+                    current,
+                )
+            )
+        if action == "show":
+            result["content"] = current
+        return result
+
     async def handle(self, request: ExtensionRequest) -> Result:
         operation = request.operation.strip().lower()
         try:
@@ -921,12 +1030,14 @@ class PromptRuntime(RuntimeService):
                 )
             elif operation == "retain_profile":
                 value = self.retain_profile(request.payload)
+            elif operation == "identity":
+                value = self.identity(request.payload)
             elif operation == "end_turn":
                 value = await self.end_turn(request.payload)
             else:
                 return _invalid(
                     "operation must be status, validate, reload, migrate, build, "
-                    "retain_profile or end_turn",
+                    "retain_profile, identity or end_turn",
                     request.session_id,
                 )
         except (OSError, TypeError, UnicodeError, ValueError) as exc:
@@ -1728,7 +1839,12 @@ class PromptRuntime(RuntimeService):
         if not self.working_memory_path.exists():
             _write_new(self.working_memory_path, "# Working memory\n")
 
-    def _migrate_legacy(self, *, prompts: bool = True) -> list[str]:
+    def _migrate_legacy(
+        self,
+        *,
+        prompts: bool = True,
+        skipped_stock: list[str] | None = None,
+    ) -> list[str]:
         assert self.data_root is not None
         assert self.prompt_root is not None
         assert self.user_profile_path is not None
@@ -1745,6 +1861,12 @@ class PromptRuntime(RuntimeService):
                     content = self._read_file(
                         legacy, self.max_layer_chars, self.legacy_prompt_root
                     )
+                    if _digest(content) in _LEGACY_STOCK_HASHES.get(
+                        target_name, set()
+                    ):
+                        if skipped_stock is not None:
+                            skipped_stock.append(legacy_name)
+                        continue
                     _write_new(target, content)
                     if target.exists():
                         migrated.append(target_name)

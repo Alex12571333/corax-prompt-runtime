@@ -4,7 +4,9 @@ import asyncio
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
+import corax_prompt_runtime as prompt_runtime
 from agent_sdk import load_extension_class
 from agent_sdk.manifests.extensions import ExtensionManifest
 from corax_prompt_runtime import PromptBundle, PromptLayer, PromptRuntime
@@ -75,6 +77,90 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
             safety.read_text(encoding="utf-8").endswith("\nOperator edit.\n")
         )
         self.assertIn("default:core/SYSTEM.md", self.runtime.last_migrations)
+
+    def test_migrate_skips_and_never_loads_stock_legacy_prompts(self) -> None:
+        legacy = Path(self.temporary.name) / "legacy"
+        legacy.mkdir()
+        (legacy / "system.md").write_text("stock system", encoding="utf-8")
+        (legacy / "safety.md").write_text("custom safety", encoding="utf-8")
+        self.runtime.legacy_prompt_root = legacy
+        stock = {
+            "legacy/SYSTEM.md": {
+                prompt_runtime._digest("stock system"),
+            },
+        }
+
+        with mock.patch.object(prompt_runtime, "_LEGACY_STOCK_HASHES", stock):
+            result = self.runtime.migrate()
+            ignored = self.data / "prompts/legacy/SYSTEM.md"
+            self.assertFalse(ignored.exists())
+            self.assertEqual(result["skipped_stock"], ["system.md"])
+            self.assertEqual(result["migrated"], ["legacy/SAFETY.md"])
+            self.assertEqual(result["status"]["layer_count"], 23)
+
+            ignored.write_text("stock system", encoding="utf-8")
+            status = self.runtime.reload()
+            self.assertEqual(status["layer_count"], 23)
+            self.assertNotIn("legacy/SYSTEM.md", self.runtime.catalog)
+            repeated = self.runtime.migrate()
+            self.assertEqual(repeated["migrated"], [])
+            self.assertEqual(repeated["skipped_stock"], [])
+            self.assertEqual(repeated["status"]["layer_count"], 23)
+
+    def test_identity_control_is_private_bounded_and_atomic(self) -> None:
+        profile = self.data / "identity/USER.md"
+        memory = self.data / "identity/MEMORY.md"
+
+        status = self.runtime.identity(
+            {"action": "status", "target": "profile"}
+        )
+        self.assertNotIn("content", status)
+        self.assertEqual(status["max_chars"], 6_000)
+
+        shown = self.runtime.identity({"action": "show", "target": "profile"})
+        self.assertEqual(shown["content"], profile.read_text(encoding="utf-8"))
+
+        replacement = (
+            "# User profile\n\nOnboarding-Complete: true\n\n"
+            "## Durable facts\n- Call me Alex\n"
+        )
+        updated = self.runtime.identity(
+            {
+                "action": "replace",
+                "target": "profile",
+                "content": replacement,
+            }
+        )
+        self.assertTrue(updated["onboarding_complete"])
+        self.assertEqual(profile.read_text(encoding="utf-8"), replacement)
+
+        with self.assertRaisesRegex(ValueError, "6000-character limit"):
+            self.runtime.identity(
+                {
+                    "action": "replace",
+                    "target": "profile",
+                    "content": "x" * 6_001,
+                }
+            )
+        self.assertEqual(profile.read_text(encoding="utf-8"), replacement)
+
+        onboarding = self.runtime.identity(
+            {"action": "onboarding", "target": "profile"}
+        )
+        self.assertFalse(onboarding["onboarding_complete"])
+        self.assertIn("Call me Alex", profile.read_text(encoding="utf-8"))
+
+        self.runtime.identity(
+            {
+                "action": "replace",
+                "target": "memory",
+                "content": "# Working memory\n- Ship Corax\n",
+            }
+        )
+        self.assertIn("Ship Corax", memory.read_text(encoding="utf-8"))
+        reset = self.runtime.identity({"action": "reset", "target": "memory"})
+        self.assertEqual(reset["chars"], len("# Working memory\n"))
+        self.assertEqual(memory.read_text(encoding="utf-8"), "# Working memory\n")
 
     def context(self, turn: str, tools: list[dict[str, str]]) -> dict:
         return {

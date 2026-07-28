@@ -55,7 +55,7 @@ loop, is retained only in process RAM; normal disk history remains the user
 message plus final assistant answer.
 
 Supported operations through `ExtensionRequest` are `status`, `validate`,
-`reload`, `migrate`, `build`, `retain_profile`, and `end_turn`.
+`reload`, `migrate`, `build`, `retain_profile`, `identity`, and `end_turn`.
 
 ## Files and configuration
 
@@ -64,7 +64,9 @@ files below `<data_root>/<root>`. A byte-identical older stock default is
 upgraded safely; any operator edit is preserved. Legacy
 `system.md` and `safety.md` are imported only by the explicit `migrate`
 operation, as dynamic compatibility layers; they never replace the stable core
-prefix. A legacy profile is migrated automatically. Identity defaults are
+prefix. Historical unmodified stock files are recognized and skipped so the
+old monolith cannot be duplicated into the new prompt. A legacy profile is
+migrated automatically. Identity defaults are
 `<data_root>/identity/USER.md` and `MEMORY.md`.
 
 Configuration keys are `enabled`, `root`, `user_profile`, `working_memory`,
@@ -143,12 +145,24 @@ corax prompts status
 corax prompts validate
 corax prompts reload
 corax prompts migrate
+corax prompts identity status profile
+corax prompts identity show profile
+corax prompts identity replace profile ./USER.md
+corax prompts identity reset memory
+corax prompts identity onboarding profile
 ```
 
 `status` reports hashes, sizes, and token estimates without printing private
 contents. `validate` fails closed on broken required layers. `reload` affects
 the next turn, never an active tool loop. `migrate` imports legacy `system.md`
 and `safety.md` only as dynamic compatibility layers.
+
+Identity `status` reports the active path and `chars/max` without content.
+`show` is the only action that prints private identity text. `replace` reads
+the named local file in the CLI and performs a bounded atomic replacement.
+`reset profile` restarts onboarding without deleting semantic-memory backend
+records; `onboarding profile` preserves current facts and only marks onboarding
+incomplete.
 
 To restore one packaged default, first move the operator file to a backup
 outside `runtime/data/prompts`, then run `corax prompts reload`; the missing
