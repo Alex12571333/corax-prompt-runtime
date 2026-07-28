@@ -781,6 +781,145 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("template.retraction", structured_ids)
         self.assertIn("behavior.current-information", structured_ids)
 
+    async def test_retraction_ledger_survives_replay_and_cold_runtime(
+        self,
+    ) -> None:
+        def context(
+            session: str, turn: str, text: str, **extra: str
+        ) -> dict:
+            return {
+                "_corax_prompt_context": {
+                    "session_id": session,
+                    "turn_id": turn,
+                    "user_text": text,
+                    "tool_descriptors": [],
+                    **extra,
+                }
+            }
+
+        async def request(
+            runtime: PromptRuntime,
+            session: str,
+            history: list[dict],
+            turn: dict,
+            records: list[dict] | None = None,
+            **extra: str,
+        ) -> dict:
+            payload = {"history": history, "turn_messages": [turn]}
+            if records is not None:
+                payload["retraction_records"] = records
+            return await runtime.build(
+                payload,
+                context=context(session, "turn-1", turn["content"], **extra),
+            )
+
+        user = {"role": "user", "content": "What year is it?"}
+        assistant = {"role": "assistant", "content": "It is 2024."}
+        correction = {
+            "role": "user",
+            "content": "That is wrong; the answer is inaccurate.",
+        }
+        baseline = await request(
+            self.runtime,
+            "retraction-baseline",
+            [],
+            {"role": "user", "content": "hi"},
+        )
+        current = await request(
+            self.runtime, "retraction-session", [user, assistant], correction
+        )
+        target = prompt_runtime._digest(assistant["content"])
+        record = {"target_sha256": target, "reason": "factual"}
+        self.assertIn(record, current["metadata"]["_retraction_records"])
+        assistant_index = current["messages"].index(assistant)
+        notice = current["messages"][assistant_index - 1]
+        self.assertEqual(notice["role"], "user")
+        self.assertIn('kind="retraction-notice"', notice["content"])
+        self.assertNotIn(target, notice["content"])
+        self.assertIn("<correction-context>", notice["content"])
+        self.assertEqual(
+            current["metadata"]["static_hash"],
+            baseline["metadata"]["static_hash"],
+        )
+
+        tool_loop = await self.runtime.build(
+            {
+                "history": [user, assistant],
+                "turn_messages": [
+                    correction,
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [{"id": "call-1"}],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "content": "2026",
+                    },
+                ],
+            },
+            context=context(
+                "retraction-session", "turn-1", correction["content"]
+            ),
+        )
+        self.assertEqual(
+            str(tool_loop["messages"]).count('kind="retraction-notice"'),
+            1,
+        )
+        await self.runtime.end_turn(
+            session_id="retraction-session",
+            turn_id="turn-1",
+            assistant_text="You are right: it is 2026.",
+        )
+        final = {"role": "assistant", "content": "You are right: it is 2026."}
+        replay = await self.runtime.build(
+            {
+                "history": [user, assistant, correction, final],
+                "turn_messages": [{"role": "user", "content": "Continue"}],
+            },
+            context=context("retraction-session", "turn-2", "Continue"),
+        )
+        self.assertEqual(
+            str(replay["messages"]).count('kind="retraction-notice"'),
+            1,
+        )
+
+        cold = PromptRuntime()
+        cold.bind(ROOT, self.data, self.workspace)
+        continued = {"role": "user", "content": "Continue"}
+        passed = await request(
+            cold, "cold-ledger", [user, assistant], continued, [record]
+        )
+        self.assertEqual(
+            str(passed["messages"]).count('kind="retraction-notice"'),
+            1,
+        )
+
+        transcript = await request(
+            cold,
+            "cold-transcript",
+            [user, assistant, correction, final],
+            continued,
+        )
+        self.assertIn(record, transcript["metadata"]["_retraction_records"])
+
+        structured = await request(
+            cold,
+            "structured-ledger",
+            [user, assistant],
+            {"role": "user", "content": "Verify it"},
+            correction_type="tool_contradiction",
+        )
+        self.assertIn(
+            {"target_sha256": target, "reason": "tool_contradiction"},
+            structured["metadata"]["_retraction_records"],
+        )
+        with self.assertRaisesRegex(ValueError, "record limit"):
+            await request(
+                cold, "oversized-ledger", [user, assistant], continued, [record] * 65
+            )
+
     async def test_identity_retention_appends_without_changing_core_prefix(
         self,
     ) -> None:

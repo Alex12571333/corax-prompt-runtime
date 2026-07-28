@@ -122,6 +122,10 @@ still performs validation and persistence.
   written to conversation checkpoints or traces. They remain in process RAM
   only to preserve the append-only provider prefix; restart begins a cold cache
   from raw user/assistant history.
+- A correction produces a bounded hash/category record for the host. On later
+  turns the runtime rebuilds a model-only notice directly before the retracted
+  assistant message; no message text or static system content enters that
+  ledger.
 - Context compaction establishes a new RAM cache epoch. Within a turn, file
   reloads and external mutation cannot alter the frozen snapshot.
 

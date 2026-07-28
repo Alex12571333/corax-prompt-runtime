@@ -163,6 +163,9 @@ _IDENTITY_CORRECTION = re.compile(
 _IDENTITY_FACT_LINE = re.compile(
     r"(?im)^-\s*(?:my name is|call me|меня зовут|называй меня)\b.*(?:\n|$)"
 )
+_SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
+_RETRACTION_REASON = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_MAX_RETRACTION_RECORDS = 64
 _MAX_AGENTS_FILES = 16
 _STOCK_DEFAULT_HASHES = {
     "behavior/CURRENT_INFORMATION.md": {
@@ -351,12 +354,14 @@ class _TurnState:
     turn_budget_chars: int = 0
     compacted_messages: int = 0
     replayed_from_ram: bool = False
+    retraction_records: list[dict[str, str]] = field(default_factory=list)
 
 
 @dataclass(slots=True)
 class _SessionState:
     raw_history: list[dict[str, Any]] = field(default_factory=list)
     effective_history: list[dict[str, Any]] = field(default_factory=list)
+    retraction_records: list[dict[str, str]] = field(default_factory=list)
 
 
 class PromptBuilder:
@@ -670,6 +675,37 @@ class PromptRuntime(RuntimeService):
             descriptors=descriptors,
         )
         session = self.sessions.get(session_id)
+        records = _merge_retraction_records(
+            _retraction_records(payload.get("retraction_records")),
+            _retraction_records(merged.get("retraction_records")),
+            session.retraction_records if session is not None else (),
+            _transcript_retraction_records(base_history),
+        )
+        current_user_text = next(
+            (
+                str(message.get("content") or "")
+                for message in raw_turn
+                if message.get("role") == "user"
+            ),
+            user_text,
+        )
+        correction = _requested_correction(payload, merged, current_user_text)
+        target = next(
+            (
+                value
+                for value in (
+                    _final_assistant_sha256(message)
+                    for message in reversed(base_history)
+                )
+                if value
+            ),
+            None,
+        )
+        if correction and target:
+            records = _merge_retraction_records(
+                records,
+                [{"target_sha256": target, "reason": correction}],
+            )
         replayed = bool(session and _is_prefix(session.raw_history, base_history))
         if replayed and session is not None:
             effective_prior = copy.deepcopy(session.effective_history) + copy.deepcopy(
@@ -677,6 +713,7 @@ class PromptRuntime(RuntimeService):
             )
         else:
             effective_prior = copy.deepcopy(base_history)
+        effective_prior = self._apply_retractions(effective_prior, records)
         layers, effective_prior, compacted = self._fit_budget(
             layers, effective_prior, raw_turn, descriptors
         )
@@ -746,6 +783,7 @@ class PromptRuntime(RuntimeService):
             ),
             compacted_messages=compacted,
             replayed_from_ram=replayed,
+            retraction_records=records,
         )
         self.turns[key] = state
         return self._state_payload(state)
@@ -868,6 +906,7 @@ class PromptRuntime(RuntimeService):
                 *copy.deepcopy(canonical_tail),
             ],
             effective_history=copy.deepcopy(effective_messages[1:]),
+            retraction_records=copy.deepcopy(state.retraction_records),
         )
         del self.turns[key]
         return {
@@ -1143,6 +1182,9 @@ class PromptRuntime(RuntimeService):
                     _descriptor_id(item) for item in state.descriptors
                 ],
                 "retraction_mode": "template.retraction" in layer_ids,
+                "_retraction_records": copy.deepcopy(
+                    state.retraction_records
+                ),
                 "current_information_mode": (
                     "behavior.current-information" in layer_ids
                 ),
@@ -1158,6 +1200,37 @@ class PromptRuntime(RuntimeService):
             },
         )
         return bundle.to_dict()
+
+    def _apply_retractions(
+        self,
+        history: list[dict[str, Any]],
+        records: Sequence[Mapping[str, str]],
+    ) -> list[dict[str, Any]]:
+        reasons = {item["target_sha256"]: item["reason"] for item in records}
+        effective: list[dict[str, Any]] = []
+        for message in history:
+            target = _final_assistant_sha256(message)
+            reason = reasons.get(target or "")
+            previous = str(effective[-1].get("content") or "") if effective else ""
+            if reason and 'kind="retraction-notice"' not in previous:
+                notice = self._render(
+                    "templates/RETRACTION_NOTICE.md",
+                    {"correction_type": reason},
+                )
+                effective.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            '<turn-envelope visibility="model-only" '
+                            'persistence="ram" kind="retraction-notice" '
+                            'trust="runtime-data">\n'
+                            f"{notice.rstrip()}\n"
+                            "</turn-envelope>"
+                        ),
+                    }
+                )
+            effective.append(copy.deepcopy(message))
+        return effective
 
     def _layers(
         self,
@@ -1375,23 +1448,7 @@ class PromptRuntime(RuntimeService):
                         priority=20,
                     )
                 )
-            structured_correction = (
-                payload.get("correction_type")
-                or context.get("correction_type")
-            )
-            correction = (
-                str(structured_correction).strip().lower()
-                if structured_correction
-                else _correction_type(user_text)
-            )
-            if (
-                not correction
-                and (
-                    payload.get("retraction_required")
-                    or context.get("retraction_required")
-                )
-            ):
-                correction = "factual"
+            correction = _requested_correction(payload, context, user_text)
             if correction and _has_prior_assistant(payload):
                 layers.append(
                     PromptLayer(
@@ -2151,6 +2208,94 @@ def _correction_type(text: str) -> str | None:
         if pattern.search(text):
             return name
     return None
+
+
+def _requested_correction(
+    payload: Mapping[str, Any],
+    context: Mapping[str, Any],
+    user_text: str,
+) -> str | None:
+    structured = payload.get("correction_type") or context.get("correction_type")
+    correction = (
+        str(structured).strip().lower()
+        if structured
+        else _correction_type(user_text)
+    )
+    if not correction and (
+        payload.get("retraction_required")
+        or context.get("retraction_required")
+    ):
+        correction = "factual"
+    if correction and not _RETRACTION_REASON.fullmatch(correction):
+        raise ValueError("correction_type must be a short category")
+    return correction or None
+
+
+def _retraction_records(value: Any) -> list[dict[str, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError("retraction_records must be a list")
+    if len(value) > _MAX_RETRACTION_RECORDS:
+        raise ValueError("retraction_records exceeds record limit")
+    records: list[dict[str, str]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise TypeError("each retraction record must be a mapping")
+        target = str(item.get("target_sha256") or "").strip().lower()
+        reason = str(item.get("reason") or "").strip().lower()
+        if not _SHA256.fullmatch(target):
+            raise ValueError("retraction target_sha256 must be a SHA-256 hex digest")
+        if not _RETRACTION_REASON.fullmatch(reason):
+            raise ValueError("retraction reason must be a short category")
+        records.append({"target_sha256": target, "reason": reason})
+    return records
+
+
+def _merge_retraction_records(
+    *groups: Sequence[Mapping[str, str]],
+) -> list[dict[str, str]]:
+    records: dict[str, dict[str, str]] = {}
+    for item in (item for group in groups for item in group):
+        key = item["target_sha256"]
+        records.pop(key, None)
+        records[key] = dict(item)
+    return list(records.values())[-_MAX_RETRACTION_RECORDS:]
+
+
+def _final_assistant_sha256(message: Mapping[str, Any]) -> str | None:
+    content = message.get("content")
+    if (
+        message.get("role") != "assistant"
+        or message.get("tool_calls")
+        or content is None
+    ):
+        return None
+    text = _context_data_text(content)
+    return _digest(text) if text.strip() else None
+
+
+def _transcript_retraction_records(
+    messages: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    target: str | None = None
+    for message in messages:
+        assistant = _final_assistant_sha256(message)
+        if assistant:
+            target = assistant
+        elif message.get("role") == "user" and target:
+            content = str(message.get("content") or "")
+            reason = (
+                None
+                if "retraction-notice" in content
+                else _correction_type(content)
+            )
+            if reason:
+                records.append(
+                    {"target_sha256": target, "reason": reason}
+                )
+    return _merge_retraction_records(records)
 
 
 def _corrected_identity_fact(text: str) -> str | None:
