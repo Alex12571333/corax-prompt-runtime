@@ -383,7 +383,7 @@ class PromptBuilder:
     id="prompts.runtime",
     name="Corax Prompt Runtime",
     description="Cache-stable layered Markdown prompt assembly.",
-    version="0.1.3",
+    version="0.1.4",
     author="Corax",
     license="MIT",
     homepage="https://github.com/Alex12571333/corax-prompt-runtime",
@@ -1891,7 +1891,7 @@ class PromptRuntime(RuntimeService):
         if not self.user_profile_path.exists():
             _write_new(
                 self.user_profile_path,
-                "# User profile\n\nOnboarding-Complete: false\n\n## Durable facts\n",
+                "# User profile\n\nOnboarding-Complete: true\n\n## Durable facts\n",
             )
         if not self.working_memory_path.exists():
             _write_new(self.working_memory_path, "# Working memory\n")

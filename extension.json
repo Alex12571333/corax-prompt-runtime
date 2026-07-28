@@ -4,7 +4,7 @@
   "kind": "runtime_service",
   "name": "Corax Prompt Runtime",
   "description": "Cache-stable layered Markdown prompt assembly.",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "author": "Corax",
   "license": "MIT",
   "homepage": "https://github.com/Alex12571333/corax-prompt-runtime",

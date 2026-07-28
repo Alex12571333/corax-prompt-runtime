@@ -162,6 +162,29 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reset["chars"], len("# Working memory\n"))
         self.assertEqual(memory.read_text(encoding="utf-8"), "# Working memory\n")
 
+    async def test_fresh_profile_skips_onboarding_until_requested(self) -> None:
+        profile = self.data / "identity/USER.md"
+        self.assertIn(
+            "Onboarding-Complete: true",
+            profile.read_text(encoding="utf-8"),
+        )
+
+        built = await self.runtime.build(
+            {
+                "history": [],
+                "turn_messages": [{"role": "user", "content": "Hello"}],
+            },
+            context=self.context("fresh-profile", []),
+        )
+
+        self.assertFalse(built["metadata"]["onboarding"])
+        self.assertNotIn(
+            "behavior.onboarding",
+            {layer["id"] for layer in built["metadata"]["layers"]},
+        )
+        reset = self.runtime.identity({"action": "reset", "target": "profile"})
+        self.assertFalse(reset["onboarding_complete"])
+
     def context(self, turn: str, tools: list[dict[str, str]]) -> dict:
         return {
             "_corax_prompt_context": {
