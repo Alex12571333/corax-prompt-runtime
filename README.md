@@ -60,7 +60,8 @@ Supported operations through `ExtensionRequest` are `status`, `validate`,
 ## Files and configuration
 
 The 22 packaged defaults live in `prompts/`. On bind they are copied to missing
-files below `<data_root>/<root>` and never overwrite operator edits. Legacy
+files below `<data_root>/<root>`. A byte-identical older stock default is
+upgraded safely; any operator edit is preserved. Legacy
 `system.md` and `safety.md` are imported only by the explicit `migrate`
 operation, as dynamic compatibility layers; they never replace the stable core
 prefix. A legacy profile is migrated automatically. Identity defaults are

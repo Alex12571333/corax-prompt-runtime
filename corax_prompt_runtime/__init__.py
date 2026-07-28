@@ -164,6 +164,23 @@ _IDENTITY_FACT_LINE = re.compile(
     r"(?im)^-\s*(?:my name is|call me|меня зовут|называй меня)\b.*(?:\n|$)"
 )
 _MAX_AGENTS_FILES = 16
+_STOCK_DEFAULT_HASHES = {
+    "behavior/CURRENT_INFORMATION.md": {
+        "19794488623f0dead93f690f59b6abeb1ae2fa0ce39f50cabec6417b31c490f6"
+    },
+    "behavior/TOOL_USE.md": {
+        "e7020f70167d37c0db263f4871793891447b34425d9d9117e5dfa26d427f2dd6"
+    },
+    "core/SAFETY.md": {
+        "6c428bfd11c99d52a7bc4f90c49da270ed24c335b3c53285e3acb906198332dc"
+    },
+    "core/SYSTEM.md": {
+        "81b7295188c1341dd1d75a0d9ca367c05e841ddaefcc0f448f8e6857846a6254"
+    },
+    "services/HEARTBEAT.md": {
+        "dfbfb2602fe8231f97031a785999641de271080c991a0470fa3804318cd279e0"
+    },
+}
 
 
 def _digest(value: str) -> str:
@@ -343,7 +360,7 @@ class PromptBuilder:
     id="prompts.runtime",
     name="Corax Prompt Runtime",
     description="Cache-stable layered Markdown prompt assembly.",
-    version="0.1.1",
+    version="0.1.2",
     author="Corax",
     license="MIT",
     homepage="https://github.com/Alex12571333/corax-prompt-runtime",
@@ -1687,10 +1704,21 @@ class PromptRuntime(RuntimeService):
             self.last_migrations = profile_migrations
         for relative in _DEFAULT_FILES:
             target = self.prompt_root / relative
-            if target.exists():
-                continue
             source = defaults / relative
             content = self._read_file(source, self.max_layer_chars, defaults)
+            if target.exists():
+                current = self._read_file(
+                    target,
+                    self.max_layer_chars,
+                    self.prompt_root,
+                )
+                if (
+                    _digest(current) in _STOCK_DEFAULT_HASHES.get(relative, set())
+                    and current != content
+                ):
+                    _atomic_write(target, content)
+                    self.last_migrations.append(f"default:{relative}")
+                continue
             _write_new(target, content)
         if not self.user_profile_path.exists():
             _write_new(
