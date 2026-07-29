@@ -164,10 +164,14 @@ _IDENTITY_CORRECTION = re.compile(
 _IDENTITY_FACT_LINE = re.compile(
     r"(?im)^-\s*(?:my name is|call me|меня зовут|называй меня)\b.*(?:\n|$)"
 )
+_ONBOARDING_LINE = re.compile(
+    r"(?im)^[ \t]*Onboarding-Complete:\s*(true|false)\s*$\n?"
+)
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _RETRACTION_REASON = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _MAX_RETRACTION_RECORDS = 64
-_REPLAY_CACHE_VERSION = 1
+_SETUP_STATE_VERSION = 1
+_REPLAY_CACHE_VERSION = 2
 _MAX_REPLAY_CACHE_BYTES = 4 * 1024 * 1024
 _MAX_AGENTS_FILES = 16
 _STOCK_DEFAULT_HASHES = {
@@ -386,7 +390,7 @@ class PromptBuilder:
     id="prompts.runtime",
     name="Corax Prompt Runtime",
     description="Cache-stable layered Markdown prompt assembly.",
-    version="0.1.5",
+    version="0.1.6",
     author="Corax",
     license="MIT",
     homepage="https://github.com/Alex12571333/corax-prompt-runtime",
@@ -422,6 +426,7 @@ class PromptRuntime(RuntimeService):
         self.prompt_root: Path | None = None
         self.user_profile_path: Path | None = None
         self.working_memory_path: Path | None = None
+        self.setup_state_path: Path | None = None
         self.enabled = True
         self.max_profile_chars = 6_000
         self.max_working_memory_chars = 8_000
@@ -462,6 +467,7 @@ class PromptRuntime(RuntimeService):
         self.prompt_root = self._data_path(root_value)
         self.user_profile_path = self._data_path(user_value)
         self.working_memory_path = self._data_path(memory_value)
+        self.setup_state_path = self.data_root / "prompt-runtime/setup.json"
         self.replay_cache_root = self.data_root / "prompt-replay"
         self.max_profile_chars = _int_config(
             values, "max_profile_chars", 6_000, 256, 64_000
@@ -1040,20 +1046,14 @@ class PromptRuntime(RuntimeService):
         if fact.casefold() in current.casefold():
             return {"retained": False, "reason": "duplicate"}
         if not current.strip():
-            current = (
-                "# User profile\n\nOnboarding-Complete: false\n\n## Durable facts\n"
-            )
-        current = re.sub(
-            r"(?im)^Onboarding-Complete:\s*false\s*$",
-            "Onboarding-Complete: true",
-            current,
-        )
-        if "Onboarding-Complete:" not in current:
-            current = "Onboarding-Complete: true\n\n" + current
+            current = "# User profile\n\n## Durable facts\n"
+        current = _ONBOARDING_LINE.sub("", current)
         candidate = current.rstrip() + f"\n- {fact}\n"
         if len(candidate) > self.max_profile_chars:
             raise ValueError("profile limit would be exceeded")
         _atomic_write(self.user_profile_path, candidate)
+        if not self._onboarding_complete():
+            self._write_setup_state(completed=True)
         return {
             "retained": True,
             "hash": _digest(fact),
@@ -1072,11 +1072,7 @@ class PromptRuntime(RuntimeService):
         if target == "profile":
             path = self.user_profile_path
             limit = self.max_profile_chars
-            reset_content = (
-                "# User profile\n\n"
-                "Onboarding-Complete: false\n\n"
-                "## Durable facts\n"
-            )
+            reset_content = "# User profile\n\n## Durable facts\n"
         elif target == "memory":
             path = self.working_memory_path
             limit = self.max_working_memory_chars
@@ -1105,21 +1101,22 @@ class PromptRuntime(RuntimeService):
                 raise ValueError(
                     f"{target} identity exceeds its {limit}-character limit"
                 )
+            if target == "profile":
+                marker = _ONBOARDING_LINE.search(content)
+                if marker:
+                    self._write_setup_state(
+                        completed=marker.group(1).casefold() == "true"
+                    )
+                    content = _ONBOARDING_LINE.sub("", content)
             _atomic_write(path, content)
             current = content
         elif action == "reset":
             _atomic_write(path, reset_content)
             current = reset_content
+            if target == "profile":
+                self._write_setup_state(completed=False)
         elif action == "onboarding":
-            if re.search(r"(?im)^Onboarding-Complete:\s*(?:true|false)\s*$", current):
-                current = re.sub(
-                    r"(?im)^Onboarding-Complete:\s*(?:true|false)\s*$",
-                    "Onboarding-Complete: false",
-                    current,
-                )
-            else:
-                current = "Onboarding-Complete: false\n\n" + current
-            _atomic_write(path, current)
+            self._write_setup_state(completed=False)
 
         result = {
             "target": target,
@@ -1131,12 +1128,7 @@ class PromptRuntime(RuntimeService):
             "applies_to": "future turns",
         }
         if target == "profile":
-            result["onboarding_complete"] = bool(
-                re.search(
-                    r"(?im)^Onboarding-Complete:\s*true\s*$",
-                    current,
-                )
-            )
+            result["onboarding_complete"] = self._onboarding_complete()
         if action == "show":
             result["content"] = current
         return result
@@ -1572,12 +1564,14 @@ class PromptRuntime(RuntimeService):
         profile = self._optional_identity(
             self.user_profile_path, self.max_profile_chars
         )
-        if profile.strip():
+        visible_profile = _ONBOARDING_LINE.sub("", profile)
+        if visible_profile.strip():
             layers.append(
                 PromptLayer(
                     "identity.user-profile",
                     self._render(
-                        "templates/USER_PROFILE.md", {"user_profile": profile}
+                        "templates/USER_PROFILE.md",
+                        {"user_profile": visible_profile},
                     ),
                     "user_profile",
                     "identity:USER.md",
@@ -1931,12 +1925,46 @@ class PromptRuntime(RuntimeService):
             return ""
 
     def _onboarding_needed(self) -> bool:
-        assert self.user_profile_path is not None
-        profile = self._optional_identity(
-            self.user_profile_path, self.max_profile_chars
+        return not self._onboarding_complete()
+
+    def _onboarding_complete(self) -> bool:
+        assert self.setup_state_path is not None
+        try:
+            payload = json.loads(
+                _read_private_bytes(self.setup_state_path, 4_096).decode("utf-8")
+            )
+        except (
+            FileNotFoundError,
+            OSError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return False
+        return bool(
+            isinstance(payload, Mapping)
+            and payload.get("version") == _SETUP_STATE_VERSION
+            and isinstance(payload.get("setup_completed_at"), str)
+            and payload["setup_completed_at"].strip()
         )
-        return not re.search(
-            r"(?im)^Onboarding-Complete:\s*true\s*$", profile
+
+    def _write_setup_state(self, *, completed: bool) -> None:
+        assert self.setup_state_path is not None
+        completed_at = (
+            datetime.now().astimezone().isoformat(timespec="seconds")
+            if completed
+            else None
+        )
+        _atomic_write(
+            self.setup_state_path,
+            json.dumps(
+                {
+                    "version": _SETUP_STATE_VERSION,
+                    "setup_completed_at": completed_at,
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
         )
 
     def _provision(self) -> None:
@@ -1979,8 +2007,26 @@ class PromptRuntime(RuntimeService):
         if not self.user_profile_path.exists():
             _write_new(
                 self.user_profile_path,
-                "# User profile\n\nOnboarding-Complete: true\n\n## Durable facts\n",
+                "# User profile\n\n## Durable facts\n",
             )
+        profile = self._optional_identity(
+            self.user_profile_path, self.max_profile_chars
+        )
+        legacy_marker = _ONBOARDING_LINE.search(profile)
+        if not self.setup_state_path.exists():
+            self._write_setup_state(
+                completed=(
+                    legacy_marker.group(1).casefold() == "true"
+                    if legacy_marker
+                    else True
+                )
+            )
+        if legacy_marker:
+            _atomic_write(
+                self.user_profile_path,
+                _ONBOARDING_LINE.sub("", profile),
+            )
+            self.last_migrations.append("identity:onboarding-state")
         if not self.working_memory_path.exists():
             _write_new(self.working_memory_path, "# Working memory\n")
 

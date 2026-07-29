@@ -132,7 +132,11 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
             }
         )
         self.assertTrue(updated["onboarding_complete"])
-        self.assertEqual(profile.read_text(encoding="utf-8"), replacement)
+        self.assertNotIn(
+            "Onboarding-Complete", profile.read_text(encoding="utf-8")
+        )
+        self.assertIn("Call me Alex", profile.read_text(encoding="utf-8"))
+        stored_profile = profile.read_text(encoding="utf-8")
 
         with self.assertRaisesRegex(ValueError, "6000-character limit"):
             self.runtime.identity(
@@ -142,7 +146,7 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
                     "content": "x" * 6_001,
                 }
             )
-        self.assertEqual(profile.read_text(encoding="utf-8"), replacement)
+        self.assertEqual(profile.read_text(encoding="utf-8"), stored_profile)
 
         onboarding = self.runtime.identity(
             {"action": "onboarding", "target": "profile"}
@@ -164,10 +168,12 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_fresh_profile_skips_onboarding_until_requested(self) -> None:
         profile = self.data / "identity/USER.md"
-        self.assertIn(
-            "Onboarding-Complete: true",
-            profile.read_text(encoding="utf-8"),
+        self.assertNotIn(
+            "Onboarding-Complete", profile.read_text(encoding="utf-8")
         )
+        setup = self.data / "prompt-runtime/setup.json"
+        self.assertTrue(setup.is_file())
+        self.assertEqual(setup.stat().st_mode & 0o077, 0)
 
         built = await self.runtime.build(
             {
@@ -184,6 +190,29 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         reset = self.runtime.identity({"action": "reset", "target": "profile"})
         self.assertFalse(reset["onboarding_complete"])
+
+    def test_legacy_onboarding_marker_migrates_to_host_state(self) -> None:
+        profile = self.data / "identity/USER.md"
+        setup = self.data / "prompt-runtime/setup.json"
+        profile.write_text(
+            "# User profile\n\nOnboarding-Complete: true\n\n"
+            "## Durable facts\n- Call me Alex\n",
+            encoding="utf-8",
+        )
+        setup.unlink()
+
+        migrated = PromptRuntime()
+        migrated.bind(ROOT, self.data, self.workspace)
+
+        self.assertNotIn(
+            "Onboarding-Complete", profile.read_text(encoding="utf-8")
+        )
+        self.assertTrue(
+            migrated.identity({"action": "status", "target": "profile"})[
+                "onboarding_complete"
+            ]
+        )
+        self.assertIn("identity:onboarding-state", migrated.last_migrations)
 
     def context(self, turn: str, tools: list[dict[str, str]]) -> dict:
         return {
@@ -847,7 +876,7 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(retained["retained"])
         profile = (self.data / "identity/USER.md").read_text(encoding="utf-8")
-        self.assertIn("Onboarding-Complete: true", profile)
+        self.assertNotIn("Onboarding-Complete", profile)
         self.assertIn("Меня зовут Алекс", profile)
 
     async def test_temporal_year_and_structured_mode_selection(self) -> None:
@@ -1090,6 +1119,11 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
                 for layer in second["metadata"]["layers"]
             )
         )
+        rendered = "\n".join(
+            str(message.get("content") or "") for message in second["messages"]
+        )
+        self.assertIn("Меня зовут Алекс", rendered)
+        self.assertNotIn("Onboarding-Complete", rendered)
 
         profile_path = self.data / "identity/USER.md"
         before_secret = profile_path.read_text(encoding="utf-8")

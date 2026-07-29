@@ -144,8 +144,11 @@ checkout:
 - edit short working context in `runtime/data/identity/MEMORY.md`;
 - configure or clear semantic memory through the selected memory provider.
 
-Keep `Onboarding-Complete: true` in a completed profile unless onboarding
-should run again. Do not place credentials in prompt or identity files.
+Like OpenClaw, onboarding completion is host-owned setup state rather than
+user-profile or memory content. Corax stores it in
+`runtime/data/prompt-runtime/setup.json`; legacy `Onboarding-Complete` lines
+are migrated out of `USER.md`. Do not place credentials in prompt or identity
+files.
 
 ```sh
 corax prompts status
