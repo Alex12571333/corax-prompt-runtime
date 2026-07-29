@@ -167,6 +167,9 @@ _IDENTITY_FACT_LINE = re.compile(
 _ONBOARDING_LINE = re.compile(
     r"(?im)^[ \t]*Onboarding-Complete:\s*(true|false)\s*$\n?"
 )
+_ONBOARDING_TOKEN = re.compile(
+    r"(?i)\bOnboarding-Complete\s*:\s*(?:true|false)\b"
+)
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _RETRACTION_REASON = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _MAX_RETRACTION_RECORDS = 64
@@ -242,6 +245,14 @@ def _safe_text(value: Any) -> str:
 def _neutralize_reserved_user_content(value: Any) -> Any:
     content = str(value or "")
     return _safe_text(content) if _RESERVED_USER_MARKER.search(content) else value
+
+
+def _redact_host_setup_state(value: Any) -> Any:
+    return (
+        _ONBOARDING_TOKEN.sub("", value)
+        if isinstance(value, str)
+        else copy.deepcopy(value)
+    )
 
 
 def _context_data_text(value: Any) -> str:
@@ -928,7 +939,13 @@ class PromptRuntime(RuntimeService):
                 != state.messages[0].get("content")
             ):
                 raise ValueError("provider messages changed the static system prefix")
+        for message in effective_messages:
+            if message.get("role") == "assistant":
+                message["content"] = _redact_host_setup_state(
+                    message.get("content")
+                )
         if assistant_text:
+            assistant_text = _redact_host_setup_state(assistant_text)
             final = {"role": "assistant", "content": assistant_text}
             if not state.messages or state.messages[-1] != final:
                 state.messages.append(final)
@@ -1102,19 +1119,14 @@ class PromptRuntime(RuntimeService):
                     f"{target} identity exceeds its {limit}-character limit"
                 )
             if target == "profile":
-                marker = _ONBOARDING_LINE.search(content)
-                if marker:
-                    self._write_setup_state(
-                        completed=marker.group(1).casefold() == "true"
-                    )
-                    content = _ONBOARDING_LINE.sub("", content)
+                content = _ONBOARDING_LINE.sub("", content)
             _atomic_write(path, content)
             current = content
         elif action == "reset":
-            _atomic_write(path, reset_content)
-            current = reset_content
             if target == "profile":
                 self._write_setup_state(completed=False)
+            _atomic_write(path, reset_content)
+            current = reset_content
         elif action == "onboarding":
             self._write_setup_state(completed=False)
 
@@ -1609,7 +1621,7 @@ class PromptRuntime(RuntimeService):
                 value = record.get("text") or record.get("content") or ""
             else:
                 value = record
-            escaped = _safe_text(value)
+            escaped = _safe_text(_redact_host_setup_state(str(value)))
             if not escaped:
                 continue
             if used + len(escaped) > self.max_layer_chars // 2:
@@ -1928,8 +1940,13 @@ class PromptRuntime(RuntimeService):
         return not self._onboarding_complete()
 
     def _onboarding_complete(self) -> bool:
+        return self._read_setup_state() is True
+
+    def _read_setup_state(self) -> bool | None:
         assert self.setup_state_path is not None
         try:
+            if self.setup_state_path.parent.is_symlink():
+                raise OSError("setup state directory cannot be a symlink")
             payload = json.loads(
                 _read_private_bytes(self.setup_state_path, 4_096).decode("utf-8")
             )
@@ -1940,16 +1957,29 @@ class PromptRuntime(RuntimeService):
             ValueError,
             json.JSONDecodeError,
         ):
+            return None
+        if (
+            not isinstance(payload, Mapping)
+            or payload.get("version") != _SETUP_STATE_VERSION
+        ):
+            return None
+        completed_at = payload.get("setup_completed_at")
+        if completed_at is None:
             return False
-        return bool(
-            isinstance(payload, Mapping)
-            and payload.get("version") == _SETUP_STATE_VERSION
-            and isinstance(payload.get("setup_completed_at"), str)
-            and payload["setup_completed_at"].strip()
+        return (
+            True
+            if isinstance(completed_at, str) and completed_at.strip()
+            else None
         )
 
     def _write_setup_state(self, *, completed: bool) -> None:
         assert self.setup_state_path is not None
+        assert self.data_root is not None
+        if self.setup_state_path.parent.is_symlink():
+            raise OSError("setup state directory cannot be a symlink")
+        self.setup_state_path.parent.mkdir(parents=True, exist_ok=True)
+        if not _within(self.setup_state_path.parent, self.data_root):
+            raise OSError("setup state directory escapes the data root")
         completed_at = (
             datetime.now().astimezone().isoformat(timespec="seconds")
             if completed
@@ -2004,7 +2034,8 @@ class PromptRuntime(RuntimeService):
                     self.last_migrations.append(f"default:{relative}")
                 continue
             _write_new(target, content)
-        if not self.user_profile_path.exists():
+        profile_created = not self.user_profile_path.exists()
+        if profile_created:
             _write_new(
                 self.user_profile_path,
                 "# User profile\n\n## Durable facts\n",
@@ -2013,15 +2044,17 @@ class PromptRuntime(RuntimeService):
             self.user_profile_path, self.max_profile_chars
         )
         legacy_marker = _ONBOARDING_LINE.search(profile)
-        if not self.setup_state_path.exists():
+        setup_state = self._read_setup_state()
+        if setup_state is None:
             self._write_setup_state(
                 completed=(
                     legacy_marker.group(1).casefold() == "true"
                     if legacy_marker
-                    else True
+                    else profile_created
                 )
             )
-        if legacy_marker:
+            setup_state = self._read_setup_state()
+        if legacy_marker and setup_state is not None:
             _atomic_write(
                 self.user_profile_path,
                 _ONBOARDING_LINE.sub("", profile),
@@ -2164,9 +2197,13 @@ def _canonical_messages(value: Any) -> list[dict[str, Any]]:
             raise ValueError(f"unsupported message role: {role!r}")
         message: dict[str, Any] = {
             "role": role,
-            "content": _neutralize_reserved_user_content(item.get("content"))
-            if role == "user"
-            else copy.deepcopy(item.get("content")),
+            "content": (
+                _neutralize_reserved_user_content(item.get("content"))
+                if role == "user"
+                else _redact_host_setup_state(item.get("content"))
+                if role == "assistant"
+                else copy.deepcopy(item.get("content"))
+            ),
         }
         for key in ("name", "tool_call_id", "tool_calls"):
             if key in item:
@@ -2184,7 +2221,12 @@ def _replay_messages(value: Any) -> list[dict[str, Any]]:
             raise TypeError("each cached message must be a mapping")
         if item.get("role") not in _ALLOWED_ROLES:
             raise ValueError("cached message has an unsupported role")
-        messages.append(copy.deepcopy(dict(item)))
+        message = copy.deepcopy(dict(item))
+        if message.get("role") == "assistant":
+            message["content"] = _redact_host_setup_state(
+                message.get("content")
+            )
+        messages.append(message)
     return messages
 
 

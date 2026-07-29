@@ -214,6 +214,55 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("identity:onboarding-state", migrated.last_migrations)
 
+        setup.unlink()
+        profile.write_text(
+            "# User profile\n\n## Durable facts\n- Call me Alex\n",
+            encoding="utf-8",
+        )
+        markerless = PromptRuntime()
+        markerless.bind(ROOT, self.data, self.workspace)
+        self.assertFalse(
+            markerless.identity({"action": "status", "target": "profile"})[
+                "onboarding_complete"
+            ]
+        )
+
+    async def test_host_setup_state_is_redacted_from_persisted_ingress(
+        self,
+    ) -> None:
+        current = "Why does Onboarding-Complete: true exist?"
+        built = await self.runtime.build(
+            {
+                "history": [
+                    {
+                        "role": "assistant",
+                        "content": "legacy Onboarding-Complete: true history",
+                    }
+                ],
+                "turn_messages": [{"role": "user", "content": current}],
+                "recalled_records": [
+                    {"text": "legacy Onboarding-Complete: false recall"}
+                ],
+            },
+            context={
+                "_corax_prompt_context": {
+                    "session_id": "legacy-service-state",
+                    "turn_id": "turn-1",
+                    "user_text": current,
+                    "tool_descriptors": [],
+                }
+            },
+        )
+
+        self.assertEqual(built["messages"][-1]["content"], current)
+        prior = "\n".join(
+            str(message.get("content") or "")
+            for message in built["messages"][:-1]
+        )
+        self.assertNotIn("Onboarding-Complete", prior)
+        self.assertIn("legacy  history", prior)
+        self.assertIn("legacy  recall", prior)
+
     def context(self, turn: str, tools: list[dict[str, str]]) -> dict:
         return {
             "_corax_prompt_context": {
