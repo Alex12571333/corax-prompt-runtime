@@ -318,6 +318,77 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('<turn-envelope visibility="model-only"', files)
         self.assertNotIn('<tool-update visibility="model-only"', files)
 
+    async def test_encrypted_replay_survives_process_restart(self) -> None:
+        first_user = {"role": "user", "content": "Run the private tool."}
+        first = await self.runtime.build(
+            {"history": [], "turn_messages": [first_user]},
+            context={
+                "_corax_prompt_context": {
+                    "channel": "console",
+                    "session_id": "restart-cache",
+                    "turn_id": "turn-1",
+                    "user_text": first_user["content"],
+                    "tool_descriptors": [],
+                }
+            },
+        )
+        private_result = "PRIVATE-TOOL-RESULT-7d320f"
+        provider_messages = [
+            *first["messages"],
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call-1", "type": "function"}],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": private_result,
+            },
+        ]
+        finalized = await self.runtime.end_turn(
+            session_id="restart-cache",
+            turn_id="turn-1",
+            assistant_text="Done.",
+            provider_messages=provider_messages,
+        )
+        self.assertTrue(finalized["replay_cache_persisted"])
+        cache_file = next((self.data / "prompt-replay").glob("*.cache"))
+        self.assertEqual(cache_file.stat().st_mode & 0o077, 0)
+        self.assertNotIn(private_result.encode(), cache_file.read_bytes())
+
+        restarted = PromptRuntime()
+        restarted.bind(ROOT, self.data, self.workspace)
+        second = await restarted.build(
+            {
+                "history": [
+                    first_user,
+                    {"role": "assistant", "content": "Done."},
+                ],
+                "turn_messages": [{"role": "user", "content": "Continue."}],
+            },
+            context={
+                "_corax_prompt_context": {
+                    "channel": "console",
+                    "session_id": "restart-cache",
+                    "turn_id": "turn-2",
+                    "user_text": "Continue.",
+                    "tool_descriptors": [],
+                }
+            },
+        )
+
+        expected_prefix = [
+            *provider_messages,
+            {"role": "assistant", "content": "Done."},
+        ]
+        self.assertEqual(
+            second["messages"][: len(expected_prefix)], expected_prefix
+        )
+        self.assertEqual(
+            second["metadata"]["session_replay"], "disk_effective"
+        )
+
     async def test_returned_nested_messages_cannot_mutate_frozen_turn(self) -> None:
         turn = [
             {"role": "user", "content": "Find a tool"},

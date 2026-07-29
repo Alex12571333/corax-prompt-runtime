@@ -51,8 +51,9 @@ Call `build` again with the same session/turn and an append-only
 `turn_messages` list after each tool result. Expanded descriptors are emitted
 as a `tool_update` envelope after that result. Call `end_turn` with the final
 assistant text. Effective history, including hidden envelopes and the tool
-loop, is retained only in process RAM; normal disk history remains the user
-message plus final assistant answer.
+loop, is retained in RAM and in an authenticated encrypted replay cache so the
+exact vLLM prefix survives a Corax restart. Normal disk history remains the
+user message plus final assistant answer.
 
 Supported operations through `ExtensionRequest` are `status`, `validate`,
 `reload`, `migrate`, `build`, `retain_profile`, `identity`, and `end_turn`.
@@ -119,9 +120,11 @@ still performs validation and persistence.
   enclosed as untrusted data. Current user statements and verified tool facts
   outrank it.
 - Full prompt bundles, schemas, recall, and selected skill bodies are never
-  written to conversation checkpoints or traces. They remain in process RAM
-  only to preserve the append-only provider prefix; restart begins a cold cache
-  from raw user/assistant history.
+  written to conversation checkpoints or traces. The provider transcript
+  without the static system message is stored only as a mode-0600 authenticated
+  encrypted replay cache under `data_root/prompt-replay`; restart restores it
+  only when its canonical history is a prefix match. Missing, corrupt, stale,
+  or unreadable cache entries fail closed to raw user/assistant history.
 - A correction produces a bounded hash/category record for the host. On later
   turns the runtime rebuilds a model-only notice directly before the retracted
   assistant message; no message text or static system content enters that

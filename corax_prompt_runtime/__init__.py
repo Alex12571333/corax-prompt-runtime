@@ -14,6 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from cryptography.fernet import Fernet, InvalidToken
 from agent_core import (
     CoreError,
     ErrorCode,
@@ -166,6 +167,8 @@ _IDENTITY_FACT_LINE = re.compile(
 _SHA256 = re.compile(r"^[0-9a-fA-F]{64}$")
 _RETRACTION_REASON = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _MAX_RETRACTION_RECORDS = 64
+_REPLAY_CACHE_VERSION = 1
+_MAX_REPLAY_CACHE_BYTES = 4 * 1024 * 1024
 _MAX_AGENTS_FILES = 16
 _STOCK_DEFAULT_HASHES = {
     "behavior/CURRENT_INFORMATION.md": {
@@ -353,7 +356,7 @@ class _TurnState:
     recovery_layer: PromptLayer | None = None
     turn_budget_chars: int = 0
     compacted_messages: int = 0
-    replayed_from_ram: bool = False
+    replay_source: str = "cold"
     retraction_records: list[dict[str, str]] = field(default_factory=list)
 
 
@@ -383,7 +386,7 @@ class PromptBuilder:
     id="prompts.runtime",
     name="Corax Prompt Runtime",
     description="Cache-stable layered Markdown prompt assembly.",
-    version="0.1.4",
+    version="0.1.5",
     author="Corax",
     license="MIT",
     homepage="https://github.com/Alex12571333/corax-prompt-runtime",
@@ -430,6 +433,7 @@ class PromptRuntime(RuntimeService):
         self.last_migrations: list[str] = []
         self.turns: dict[tuple[str, str], _TurnState] = {}
         self.sessions: dict[str, _SessionState] = {}
+        self.replay_cache_root: Path | None = None
         self.builder = PromptBuilder(self)
 
     def bind(
@@ -458,6 +462,7 @@ class PromptRuntime(RuntimeService):
         self.prompt_root = self._data_path(root_value)
         self.user_profile_path = self._data_path(user_value)
         self.working_memory_path = self._data_path(memory_value)
+        self.replay_cache_root = self.data_root / "prompt-replay"
         self.max_profile_chars = _int_config(
             values, "max_profile_chars", 6_000, 256, 64_000
         )
@@ -602,6 +607,81 @@ class PromptRuntime(RuntimeService):
             "errors": dict(self.errors),
         }
 
+    def _load_session(self, session_id: str) -> _SessionState | None:
+        try:
+            path = self._replay_path(session_id)
+            encrypted = _read_private_bytes(
+                path, _MAX_REPLAY_CACHE_BYTES * 2
+            )
+            decoded = self._replay_cipher().decrypt(encrypted)
+            if len(decoded) > _MAX_REPLAY_CACHE_BYTES:
+                return None
+            payload = json.loads(decoded)
+            if (
+                not isinstance(payload, Mapping)
+                or payload.get("version") != _REPLAY_CACHE_VERSION
+                or payload.get("session_sha256") != _digest(session_id)
+            ):
+                return None
+            return _SessionState(
+                raw_history=_replay_messages(payload.get("raw_history")),
+                effective_history=_replay_messages(
+                    payload.get("effective_history")
+                ),
+                retraction_records=_retraction_records(
+                    payload.get("retraction_records")
+                ),
+            )
+        except (
+            FileNotFoundError,
+            InvalidToken,
+            OSError,
+            TypeError,
+            UnicodeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            return None
+
+    def _save_session(self, session_id: str, session: _SessionState) -> bool:
+        try:
+            encoded = json.dumps(
+                {
+                    "version": _REPLAY_CACHE_VERSION,
+                    "session_sha256": _digest(session_id),
+                    "raw_history": session.raw_history,
+                    "effective_history": session.effective_history,
+                    "retraction_records": session.retraction_records,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            if len(encoded) > _MAX_REPLAY_CACHE_BYTES:
+                return False
+            encrypted = self._replay_cipher().encrypt(encoded)
+            _atomic_write_bytes(self._replay_path(session_id), encrypted)
+            return True
+        except (OSError, TypeError, UnicodeError, ValueError):
+            return False
+
+    def _replay_path(self, session_id: str) -> Path:
+        if self.replay_cache_root is None:
+            raise RuntimeError("prompt runtime is not bound")
+        return self.replay_cache_root / f"{_digest(session_id)}.cache"
+
+    def _replay_cipher(self) -> Fernet:
+        if self.replay_cache_root is None:
+            raise RuntimeError("prompt runtime is not bound")
+        root = self.replay_cache_root
+        if root.is_symlink():
+            raise OSError("prompt replay cache root cannot be a symlink")
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root.chmod(0o700)
+        key_path = root / "key"
+        if not key_path.exists():
+            _write_private_key(key_path, Fernet.generate_key())
+        return Fernet(_read_private_bytes(key_path, 256))
+
     async def build(
         self,
         payload: Mapping[str, Any],
@@ -675,6 +755,12 @@ class PromptRuntime(RuntimeService):
             descriptors=descriptors,
         )
         session = self.sessions.get(session_id)
+        replay_source = "ram_effective" if session is not None else "cold"
+        if session is None:
+            session = self._load_session(session_id)
+            if session is not None:
+                self.sessions[session_id] = session
+                replay_source = "disk_effective"
         records = _merge_retraction_records(
             _retraction_records(payload.get("retraction_records")),
             _retraction_records(merged.get("retraction_records")),
@@ -782,7 +868,7 @@ class PromptRuntime(RuntimeService):
                 descriptors,
             ),
             compacted_messages=compacted,
-            replayed_from_ram=replayed,
+            replay_source=replay_source if replayed else "cold",
             retraction_records=records,
         )
         self.turns[key] = state
@@ -908,6 +994,9 @@ class PromptRuntime(RuntimeService):
             effective_history=copy.deepcopy(effective_messages[1:]),
             retraction_records=copy.deepcopy(state.retraction_records),
         )
+        replay_cache_persisted = self._save_session(
+            session_id, self.sessions[session_id]
+        )
         del self.turns[key]
         return {
             "session_id": session_id,
@@ -920,6 +1009,7 @@ class PromptRuntime(RuntimeService):
             "effective_history_messages": len(
                 self.sessions[session_id].effective_history
             ),
+            "replay_cache_persisted": replay_cache_persisted,
         }
 
     def retain_profile(self, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1171,9 +1261,7 @@ class PromptRuntime(RuntimeService):
             ),
             metadata={
                 "generation": state.generation,
-                "session_replay": (
-                    "ram_effective" if state.replayed_from_ram else "cold"
-                ),
+                "session_replay": state.replay_source,
                 "frozen_turn_snapshot": True,
                 "append_only": True,
                 "hidden_envelopes": [dict(item) for item in state.hidden],
@@ -2041,6 +2129,19 @@ def _canonical_messages(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _replay_messages(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise TypeError("cached messages must be a list")
+    messages: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise TypeError("each cached message must be a mapping")
+        if item.get("role") not in _ALLOWED_ROLES:
+            raise ValueError("cached message has an unsupported role")
+        messages.append(copy.deepcopy(dict(item)))
+    return messages
+
+
 def _split_input(
     payload: Mapping[str, Any], user_text: str
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2338,6 +2439,56 @@ def _atomic_write(path: Path, content: str) -> None:
     )
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _read_private_bytes(path: Path, max_bytes: int) -> bytes:
+    metadata = path.lstat()
+    if path.is_symlink() or not path.is_file():
+        raise OSError("private cache entry must be a regular file")
+    if hasattr(os, "getuid") and metadata.st_uid != os.getuid():
+        raise OSError("private cache entry has the wrong owner")
+    if metadata.st_mode & 0o077 or metadata.st_size > max_bytes:
+        raise OSError("private cache entry has unsafe permissions or size")
+    return path.read_bytes()
+
+
+def _write_private_key(path: Path, content: bytes) -> None:
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            pass
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", dir=path.parent
+    )
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corax-prompt-runtime"
-version = "0.1.4"
+version = "0.1.5"
 description = "Cache-stable layered Markdown prompt runtime for Corax."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,7 +12,8 @@ license = {text = "MIT"}
 authors = [{name = "Corax"}]
 dependencies = [
   "agent-core @ git+https://github.com/Alex12571333/agent-core.git",
-  "agent-sdk @ git+https://github.com/Alex12571333/agent-sdk.git"
+  "agent-sdk @ git+https://github.com/Alex12571333/agent-sdk.git",
+  "cryptography>=42,<50"
 ]
 
 [tool.setuptools.packages.find]
