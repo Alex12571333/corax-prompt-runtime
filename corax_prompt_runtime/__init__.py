@@ -885,7 +885,7 @@ class PromptRuntime(RuntimeService):
         commit: bool = True,
         provider_messages: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
-        """Finalize one turn into RAM-only effective replay."""
+        """Finalize one turn into cache-stable effective replay."""
 
         values = dict(payload or {})
         session_id = str(session_id or values.get("session_id") or "default")

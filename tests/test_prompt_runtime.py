@@ -389,6 +389,29 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
             second["metadata"]["session_replay"], "disk_effective"
         )
 
+        cache_file.write_bytes(b"corrupt")
+        cold = PromptRuntime()
+        cold.bind(ROOT, self.data, self.workspace)
+        fallback = await cold.build(
+            {
+                "history": [
+                    first_user,
+                    {"role": "assistant", "content": "Done."},
+                ],
+                "turn_messages": [{"role": "user", "content": "Fallback."}],
+            },
+            context={
+                "_corax_prompt_context": {
+                    "session_id": "restart-cache",
+                    "turn_id": "turn-3",
+                    "user_text": "Fallback.",
+                    "tool_descriptors": [],
+                }
+            },
+        )
+        self.assertEqual(fallback["metadata"]["session_replay"], "cold")
+        self.assertNotIn(private_result, str(fallback["messages"]))
+
     async def test_returned_nested_messages_cannot_mutate_frozen_turn(self) -> None:
         turn = [
             {"role": "user", "content": "Find a tool"},
