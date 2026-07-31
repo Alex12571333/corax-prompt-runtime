@@ -841,6 +841,8 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
             self.runtime.object_facade_max_chars(),
             self.runtime.max_layer_chars,
         )
+        self.runtime.max_layer_chars = 1_024
+        self.assertEqual(self.runtime.object_facade_max_chars(), 0)
 
     async def test_only_nested_exact_object_mode_changes_legacy_prompt(
         self,
