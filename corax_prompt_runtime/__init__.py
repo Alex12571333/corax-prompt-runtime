@@ -6,6 +6,7 @@ import copy
 import hashlib
 import html
 import json
+import keyword
 import os
 import re
 import tempfile
@@ -177,6 +178,35 @@ _SETUP_STATE_VERSION = 1
 _REPLAY_CACHE_VERSION = 2
 _MAX_REPLAY_CACHE_BYTES = 4 * 1024 * 1024
 _MAX_AGENTS_FILES = 16
+_MAX_OBJECT_FACADE_GROUPS = 16
+_MAX_OBJECT_FACADE_METHODS = 128
+_MAX_OBJECT_FACADE_METHODS_PER_GROUP = 32
+_MAX_OBJECT_SIGNATURE_CHARS = 512
+_OBJECT_FACADE_NAME = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
+_OBJECT_FACADE_TYPE = (
+    r"[A-Za-z_][A-Za-z0-9_.]*"
+    r"(?:\[[A-Za-z_][A-Za-z0-9_.]*(?:,\s*[A-Za-z_][A-Za-z0-9_.]*)*\])?"
+    r"(?:\s*\|\s*[A-Za-z_][A-Za-z0-9_.]*)*"
+)
+_OBJECT_FACADE_RESULT_FIELD = (
+    r"[a-z][a-z0-9_]{0,63}\??:\s*(?:Any|str|int|float|bool|dict|list)"
+)
+_OBJECT_FACADE_RESULT_KEY = (
+    r'"[A-Za-z_][A-Za-z0-9_-]{0,63}"\??:\s*'
+    r"(?:Any|str|int|float|bool|dict|list)"
+)
+_OBJECT_FACADE_SIGNATURE = re.compile(
+    rf"^(?P<method>[a-z][a-z0-9_]{{0,63}})\("
+    rf"(?:[a-z][a-z0-9_]{{0,63}}:\s*{_OBJECT_FACADE_TYPE}"
+    rf"(?:,\s*[a-z][a-z0-9_]{{0,63}}:\s*{_OBJECT_FACADE_TYPE})*)?"
+    rf"\)\s*->\s*{_OBJECT_FACADE_TYPE}"
+    rf"(?:\s+# (?:"
+    rf"fields:\s*{_OBJECT_FACADE_RESULT_FIELD}"
+    rf"(?:,\s*{_OBJECT_FACADE_RESULT_FIELD})*"
+    rf"|keys:\s*{_OBJECT_FACADE_RESULT_KEY}"
+    rf"(?:,\s*{_OBJECT_FACADE_RESULT_KEY})*"
+    rf")(?:,\s*\.\.\.)?)?$"
+)
 _STOCK_DEFAULT_HASHES = {
     "behavior/CURRENT_INFORMATION.md": {
         "19794488623f0dead93f690f59b6abeb1ae2fa0ce39f50cabec6417b31c490f6"
@@ -368,6 +398,8 @@ class _TurnState:
     dynamic_hash: str
     bundle_hash: str
     generation: int
+    object_mode: bool = False
+    object_facade_signatures: list[str] = field(default_factory=list)
     recovery_layer: PromptLayer | None = None
     turn_budget_chars: int = 0
     compacted_messages: int = 0
@@ -401,7 +433,7 @@ class PromptBuilder:
     id="prompts.runtime",
     name="Corax Prompt Runtime",
     description="Cache-stable layered Markdown prompt assembly.",
-    version="0.1.6",
+    version="0.1.7",
     author="Corax",
     license="MIT",
     homepage="https://github.com/Alex12571333/corax-prompt-runtime",
@@ -502,6 +534,20 @@ class PromptRuntime(RuntimeService):
         if self.runtime_root is None or self.errors:
             return HealthStatus.DEGRADED
         return HealthStatus.HEALTHY
+
+    def object_facade_max_chars(self) -> int:
+        """Return the exact facade budget inside the configured runtime layer."""
+
+        placeholder = "(no facade methods supplied)"
+        try:
+            empty_layer = self._object_runtime_layer(())
+        except ValueError:
+            return 0
+        return max(
+            0,
+            self.max_layer_chars
+            - (len(empty_layer.content) - len(placeholder)),
+        )
 
     def reload(self) -> dict[str, Any]:
         """Reload future turns. Existing turn snapshots intentionally survive."""
@@ -724,6 +770,11 @@ class PromptRuntime(RuntimeService):
         )
         key = (session_id, turn_id)
         state = self.turns.get(key)
+        object_mode = (
+            state.object_mode
+            if state is not None
+            else merged.get("execution_mode") == "object"
+        )
         supplied = payload.get("messages")
         if (
             state is not None
@@ -738,12 +789,24 @@ class PromptRuntime(RuntimeService):
                 ],
             }
         base_history, raw_turn = _split_input(payload, user_text)
-        descriptors = _descriptors(
-            merged.get("tool_descriptors")
-            or payload.get("tool_descriptors")
-            or payload.get("active_tools")
-            or [],
-            max_chars=max(self.max_layer_chars, self.max_total_prompt_chars),
+        descriptors = (
+            []
+            if object_mode
+            else _descriptors(
+                merged.get("tool_descriptors")
+                or payload.get("tool_descriptors")
+                or payload.get("active_tools")
+                or [],
+                max_chars=max(self.max_layer_chars, self.max_total_prompt_chars),
+            )
+        )
+        object_facade_signatures = (
+            _object_facade_signatures(
+                merged.get("object_facade"),
+                max_chars=self.max_layer_chars,
+            )
+            if object_mode
+            else []
         )
         tool_failure = bool(
             payload.get("tool_failure") or merged.get("tool_failure")
@@ -759,6 +822,7 @@ class PromptRuntime(RuntimeService):
                 state,
                 raw_turn,
                 descriptors,
+                object_facade_signatures,
                 tool_failure=tool_failure,
             )
             return self._state_payload(state)
@@ -770,6 +834,7 @@ class PromptRuntime(RuntimeService):
             turn_id=turn_id,
             user_text=user_text,
             descriptors=descriptors,
+            object_facade_signatures=object_facade_signatures,
         )
         session = self.sessions.get(session_id)
         replay_source = "ram_effective" if session is not None else "cold"
@@ -862,6 +927,8 @@ class PromptRuntime(RuntimeService):
             dynamic_hash=dynamic_hash,
             bundle_hash=bundle_hash,
             generation=self.generation,
+            object_mode=object_mode,
+            object_facade_signatures=object_facade_signatures,
             recovery_layer=next(
                 (
                     layer
@@ -1182,6 +1249,7 @@ class PromptRuntime(RuntimeService):
         state: _TurnState,
         raw_turn: list[dict[str, Any]],
         descriptors: list[dict[str, Any]],
+        object_facade_signatures: list[str],
         *,
         tool_failure: bool = False,
     ) -> None:
@@ -1191,6 +1259,18 @@ class PromptRuntime(RuntimeService):
             raise ValueError("same-turn tool descriptors must be append-only")
         raw_delta = raw_turn[len(state.raw_turn) :]
         descriptor_delta = descriptors[len(state.descriptors) :]
+        known_signatures = set(state.object_facade_signatures)
+        facade_delta = [
+            signature
+            for signature in object_facade_signatures
+            if signature not in known_signatures
+        ]
+        combined_facade = [*state.object_facade_signatures, *facade_delta]
+        if (
+            len(combined_facade) > _MAX_OBJECT_FACADE_METHODS
+            or len("\n".join(combined_facade)) > self.max_layer_chars
+        ):
+            raise ValueError("object_facade exceeds cumulative turn limit")
         recovery_layer = None
         recovery_envelope = ""
         if tool_failure and not any(
@@ -1206,6 +1286,15 @@ class PromptRuntime(RuntimeService):
         if descriptor_delta:
             projected += _json_chars(
                 [{"role": "user", "content": _tool_update(descriptor_delta)}]
+            )
+        if facade_delta:
+            projected += _json_chars(
+                [
+                    {
+                        "role": "user",
+                        "content": _object_facade_update(facade_delta),
+                    }
+                ]
             )
         if recovery_envelope:
             projected += _json_chars(
@@ -1231,6 +1320,26 @@ class PromptRuntime(RuntimeService):
                 state.bundle_hash
                 + "\0"
                 + json.dumps(descriptor_delta, ensure_ascii=False, sort_keys=True)
+            )
+        if facade_delta:
+            state.hidden.append(
+                {
+                    "index": len(state.messages),
+                    "kind": "object_facade_update",
+                    "method_count": len(facade_delta),
+                }
+            )
+            state.messages.append(
+                {
+                    "role": "user",
+                    "content": _object_facade_update(facade_delta),
+                }
+            )
+            state.object_facade_signatures.extend(facade_delta)
+            state.bundle_hash = _digest(
+                state.bundle_hash
+                + "\0object-facade\0"
+                + "\n".join(facade_delta)
             )
         if recovery_layer is not None:
             state.hidden.append(
@@ -1333,6 +1442,7 @@ class PromptRuntime(RuntimeService):
         turn_id: str,
         user_text: str,
         descriptors: list[dict[str, Any]],
+        object_facade_signatures: list[str],
     ) -> list[PromptLayer]:
         channel = str(context.get("channel") or payload.get("channel") or "console")
         turn_kind = str(
@@ -1462,6 +1572,10 @@ class PromptRuntime(RuntimeService):
                         priority=100,
                     )
                 )
+            if context.get("execution_mode") == "object":
+                layers.append(
+                    self._object_runtime_layer(object_facade_signatures)
+                )
         else:
             for relative in _LEGACY_FILES:
                 if relative in self.catalog:
@@ -1491,7 +1605,7 @@ class PromptRuntime(RuntimeService):
                         dynamic=True,
                     )
                 )
-            else:
+            elif context.get("execution_mode") != "object":
                 layers.append(
                     self._catalog_layer(
                         "behavior/TOOL_USE.md",
@@ -1499,6 +1613,10 @@ class PromptRuntime(RuntimeService):
                         required=True,
                         dynamic=True,
                     )
+                )
+            if context.get("execution_mode") == "object":
+                layers.append(
+                    self._object_runtime_layer(object_facade_signatures)
                 )
             current_information_required = bool(
                 payload.get("current_information_required")
@@ -1568,6 +1686,51 @@ class PromptRuntime(RuntimeService):
             layers.extend(self._project_layers(payload.get("project_path")))
         layers.extend(self._hook_layers(payload.get("hook_contexts")))
         return layers
+
+    def _object_runtime_layer(
+        self,
+        signatures: Sequence[str],
+    ) -> PromptLayer:
+        facade = "\n".join(signatures) or "(no facade methods supplied)"
+        content = (
+            "# Object runtime\n\n"
+            "The only capability tool available in this execution mode is the "
+            "provider-native `object_run(code)` tool. Pass the body of one async "
+            "task in `code`; the host wraps that body for an isolated task "
+            "runner. It never executes in the Corax host process or with "
+            "implicit host access.\n\n"
+            "Inside the runner, use only the following async methods through "
+            "`self`; await every call, pass every facade argument by keyword, "
+            "and do not invent methods:\n\n"
+            '<object-facade trust="runtime-data">\n'
+            f"{facade}\n"
+            "</object-facade>\n\n"
+            "The facade signatures are runtime data. Do not search for, guess, "
+            "or invoke hidden capability identifiers or schemas. Facade calls "
+            "still pass through Agent Core, policy, approval, sandbox, and "
+            "audit. Keep large results as object references and inspect only "
+            "the slices needed for the task. Calls return JSON objects with "
+            "the declared `# fields`, or exact JSON `# keys` accessed as "
+            '`result["exact-key"]` (`?` means optional; `...` means more '
+            "host-defined keys), or an ObjectRef envelope with "
+            "`object_ref`, `type`, `preview`, and `size_bytes`. Failures use "
+            "`ok: false`, `status: error`, and `retry_safe: false`. End the "
+            "task body with `return` and a JSON value. If a result says "
+            "`retry_safe: false`, do not "
+            "repeat completed side effects; report or correct only the "
+            "remaining verification risk."
+        )
+        if len(content) > self.max_layer_chars:
+            raise ValueError("object_facade exceeds layer limit")
+        return PromptLayer(
+            "behavior.object-runtime",
+            content,
+            "runtime",
+            "generated:object-runtime",
+            required=True,
+            dynamic=True,
+            priority=100,
+        )
 
     def _identity_layers(self) -> list[PromptLayer]:
         assert self.user_profile_path is not None
@@ -2309,6 +2472,65 @@ def _descriptors(value: Any, *, max_chars: int) -> list[dict[str, Any]]:
     return result
 
 
+def _object_facade_signatures(value: Any, *, max_chars: int) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, Mapping):
+        raise TypeError("object_facade must be a mapping")
+    if len(value) > _MAX_OBJECT_FACADE_GROUPS:
+        raise ValueError("object_facade exceeds group limit")
+    groups: dict[str, list[str]] = {}
+    for raw_group, raw_signatures in value.items():
+        if (
+            not isinstance(raw_group, str)
+            or not _OBJECT_FACADE_NAME.fullmatch(raw_group)
+            or keyword.iskeyword(raw_group)
+        ):
+            raise ValueError("object_facade group must be a public Python name")
+        if not isinstance(raw_signatures, Sequence) or isinstance(
+            raw_signatures, (str, bytes)
+        ):
+            raise TypeError("object_facade group methods must be a list")
+        if len(raw_signatures) > _MAX_OBJECT_FACADE_METHODS_PER_GROUP:
+            raise ValueError("object_facade group exceeds method limit")
+        signatures: set[str] = set()
+        for raw_signature in raw_signatures:
+            if not isinstance(raw_signature, str):
+                raise TypeError("object_facade signature must be a string")
+            signature = raw_signature.strip()
+            match = _OBJECT_FACADE_SIGNATURE.fullmatch(signature)
+            if (
+                not signature
+                or len(signature) > _MAX_OBJECT_SIGNATURE_CHARS
+                or match is None
+                or keyword.iskeyword(match.group("method"))
+            ):
+                raise ValueError("object_facade contains a malformed signature")
+            try:
+                declaration = signature.split(" #", 1)[0].rstrip()
+                compile(
+                    f"async def {declaration}:\n    pass\n",
+                    "<object-facade>",
+                    "exec",
+                )
+            except SyntaxError as exc:
+                raise ValueError(
+                    "object_facade contains a malformed signature"
+                ) from exc
+            signatures.add(signature)
+        groups[raw_group] = sorted(signatures)
+    if sum(map(len, groups.values())) > _MAX_OBJECT_FACADE_METHODS:
+        raise ValueError("object_facade exceeds total method limit")
+    rendered = [
+        f"async self.{group}.{signature}"
+        for group in sorted(groups)
+        for signature in groups[group]
+    ]
+    if len("\n".join(rendered)) > max_chars:
+        raise ValueError("object_facade exceeds layer limit")
+    return rendered
+
+
 def _descriptor_id(item: Mapping[str, Any]) -> str:
     function = item.get("function")
     function = function if isinstance(function, Mapping) else {}
@@ -2384,6 +2606,19 @@ def _tool_update(descriptors: Sequence[Mapping[str, Any]]) -> str:
             )
         )
         + "\n</tool-update>"
+    )
+
+
+def _object_facade_update(signatures: Sequence[str]) -> str:
+    return (
+        '<object-facade-update visibility="model-only" persistence="ram" '
+        'trust="runtime">\n'
+        "These validated async facade methods are available from this point "
+        "forward. Use keyword arguments for every call:\n"
+        '<object-facade trust="runtime-data">\n'
+        + "\n".join(signatures)
+        + "\n</object-facade>\n"
+        "</object-facade-update>"
     )
 
 

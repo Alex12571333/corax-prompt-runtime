@@ -8,12 +8,14 @@ envelope after the tool result; it never rebuilds the existing turn prefix.
 Profile and working-memory edits therefore change only a future appended
 envelope, never the eternal core system prefix.
 
-The provider-native tool list is always the fixed `tool_search` + `tool_call`
-pair. Schemas selected for a turn are runtime data inside the appended envelope
-so changing capabilities cannot invalidate the provider prefix. Earlier
-envelopes remain only in RAM as part of that prefix; the newest runtime block
-governs the newest user turn. Traces expose IDs and hashes, never schemas,
-compiled prompts, profile text, or recalled memory.
+Legacy mode keeps the fixed `tool_search` + `tool_call` provider tool list and
+places selected schemas in the appended envelope. Object mode instead keeps
+the fixed `object_run(code)` tool and appends compact validated Python
+signatures. Newly activated methods arrive in an append-only
+`object-facade-update`; existing method bindings and the cached prefix are not
+rewritten. Earlier envelopes remain only in RAM as part of that prefix; the
+newest runtime block governs the newest user turn. Traces expose IDs and
+hashes, never schemas, compiled prompts, profile text, or recalled memory.
 
 ## Integration
 
