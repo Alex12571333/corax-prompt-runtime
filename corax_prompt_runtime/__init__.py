@@ -535,6 +535,20 @@ class PromptRuntime(RuntimeService):
             return HealthStatus.DEGRADED
         return HealthStatus.HEALTHY
 
+    def object_facade_max_chars(self) -> int:
+        """Return the exact facade budget inside the configured runtime layer."""
+
+        placeholder = "(no facade methods supplied)"
+        try:
+            empty_layer = self._object_runtime_layer(())
+        except ValueError:
+            return 0
+        return max(
+            0,
+            self.max_layer_chars
+            - (len(empty_layer.content) - len(placeholder)),
+        )
+
     def reload(self) -> dict[str, Any]:
         """Reload future turns. Existing turn snapshots intentionally survive."""
 

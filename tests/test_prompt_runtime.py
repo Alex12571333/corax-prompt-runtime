@@ -836,6 +836,11 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn(f"async self.web.{signature}", str(built["messages"]))
         self.assertIn('`result["exact-key"]`', str(built["messages"]))
+        self.assertGreater(self.runtime.object_facade_max_chars(), 0)
+        self.assertLess(
+            self.runtime.object_facade_max_chars(),
+            self.runtime.max_layer_chars,
+        )
 
     async def test_only_nested_exact_object_mode_changes_legacy_prompt(
         self,
