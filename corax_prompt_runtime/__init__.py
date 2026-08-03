@@ -433,7 +433,7 @@ class PromptBuilder:
     id="prompts.runtime",
     name="Corax Prompt Runtime",
     description="Cache-stable layered Markdown prompt assembly.",
-    version="0.1.7",
+    version="0.1.8",
     author="Corax",
     license="MIT",
     homepage="https://github.com/Alex12571333/corax-prompt-runtime",
@@ -811,6 +811,10 @@ class PromptRuntime(RuntimeService):
         tool_failure = bool(
             payload.get("tool_failure") or merged.get("tool_failure")
         )
+        final_response_retry = bool(
+            payload.get("final_response_retry")
+            or merged.get("final_response_retry")
+        )
         if not self.enabled:
             return {
                 "messages": base_history + raw_turn,
@@ -824,6 +828,7 @@ class PromptRuntime(RuntimeService):
                 descriptors,
                 object_facade_signatures,
                 tool_failure=tool_failure,
+                final_response_retry=final_response_retry,
             )
             return self._state_payload(state)
 
@@ -835,6 +840,7 @@ class PromptRuntime(RuntimeService):
             user_text=user_text,
             descriptors=descriptors,
             object_facade_signatures=object_facade_signatures,
+            final_response_retry=final_response_retry,
         )
         session = self.sessions.get(session_id)
         replay_source = "ram_effective" if session is not None else "cold"
@@ -1252,6 +1258,7 @@ class PromptRuntime(RuntimeService):
         object_facade_signatures: list[str],
         *,
         tool_failure: bool = False,
+        final_response_retry: bool = False,
     ) -> None:
         if not _is_prefix(state.raw_turn, raw_turn):
             raise ValueError("same-turn messages must be append-only")
@@ -1271,17 +1278,33 @@ class PromptRuntime(RuntimeService):
             or len("\n".join(combined_facade)) > self.max_layer_chars
         ):
             raise ValueError("object_facade exceeds cumulative turn limit")
-        recovery_layer = None
-        recovery_envelope = ""
+        late_layers: list[tuple[PromptLayer, str, str]] = []
         if tool_failure and not any(
             layer.id == "behavior.recovery" for layer in state.layers
         ):
-            recovery_layer = state.recovery_layer
-            if recovery_layer is not None:
-                recovery_envelope = _turn_envelope(
-                    _render_layers((recovery_layer,)),
-                    (),
+            if state.recovery_layer is not None:
+                late_layers.append(
+                    (
+                        state.recovery_layer,
+                        "recovery",
+                        _turn_envelope(
+                            _render_layers((state.recovery_layer,)),
+                            (),
+                        ),
+                    )
                 )
+        if final_response_retry and not any(
+            layer.id == "behavior.final-response-retry"
+            for layer in state.layers
+        ):
+            layer = self._final_response_retry_layer()
+            late_layers.append(
+                (
+                    layer,
+                    "final_response_retry",
+                    _turn_envelope(_render_layers((layer,)), ()),
+                )
+            )
         projected = state.turn_budget_chars + _json_chars(raw_delta)
         if descriptor_delta:
             projected += _json_chars(
@@ -1296,9 +1319,9 @@ class PromptRuntime(RuntimeService):
                     }
                 ]
             )
-        if recovery_envelope:
+        for _, _, envelope in late_layers:
             projected += _json_chars(
-                [{"role": "user", "content": recovery_envelope}]
+                [{"role": "user", "content": envelope}]
             )
         if projected > self.max_total_prompt_chars:
             raise ValueError("same-turn append would exceed prompt budget")
@@ -1341,22 +1364,22 @@ class PromptRuntime(RuntimeService):
                 + "\0object-facade\0"
                 + "\n".join(facade_delta)
             )
-        if recovery_layer is not None:
+        for layer, kind, envelope in late_layers:
             state.hidden.append(
                 {
                     "index": len(state.messages),
-                    "kind": "recovery",
-                    "layer_ids": [recovery_layer.id],
+                    "kind": kind,
+                    "layer_ids": [layer.id],
                 }
             )
             state.messages.append(
-                {"role": "user", "content": recovery_envelope}
+                {"role": "user", "content": envelope}
             )
-            state.layers = (*state.layers, recovery_layer)
+            state.layers = (*state.layers, layer)
             state.bundle_hash = _digest(
                 state.bundle_hash
-                + "\0recovery\0"
-                + recovery_layer.content_hash
+                + f"\0{kind}\0"
+                + layer.content_hash
             )
         state.turn_budget_chars = projected
 
@@ -1443,6 +1466,7 @@ class PromptRuntime(RuntimeService):
         user_text: str,
         descriptors: list[dict[str, Any]],
         object_facade_signatures: list[str],
+        final_response_retry: bool = False,
     ) -> list[PromptLayer]:
         channel = str(context.get("channel") or payload.get("channel") or "console")
         turn_kind = str(
@@ -1685,7 +1709,26 @@ class PromptRuntime(RuntimeService):
             layers.extend(self._skill_layers(payload.get("selected_skills")))
             layers.extend(self._project_layers(payload.get("project_path")))
         layers.extend(self._hook_layers(payload.get("hook_contexts")))
+        if final_response_retry:
+            layers.append(self._final_response_retry_layer())
         return layers
+
+    def _final_response_retry_layer(self) -> PromptLayer:
+        return PromptLayer(
+            "behavior.final-response-retry",
+            (
+                "# Final response recovery\n\n"
+                "The previous model attempt produced no user-visible answer. "
+                "Return the final user-facing result now. Include completed "
+                "artifact paths or a concise failure explanation. Do not "
+                "repeat completed side effects."
+            ),
+            "runtime",
+            "generated:final-response-retry",
+            required=True,
+            dynamic=True,
+            priority=100,
+        )
 
     def _object_runtime_layer(
         self,
@@ -1701,7 +1744,12 @@ class PromptRuntime(RuntimeService):
             "implicit host access.\n\n"
             "Inside the runner, use only the following async methods through "
             "`self`; await every call, pass every facade argument by keyword, "
-            "and do not invent methods:\n\n"
+            "and do not invent methods. Local `os` and `pathlib` paths describe "
+            "only the ephemeral runner. Paths passed to `self.files.*` are "
+            "interpreted by the host, not inside the runner: use Corax "
+            "workspace-relative paths or a user-requested absolute/`~/...` "
+            "host path for writes, never runner paths such as `/workspace` "
+            "or `/root`:\n\n"
             '<object-facade trust="runtime-data">\n'
             f"{facade}\n"
             "</object-facade>\n\n"

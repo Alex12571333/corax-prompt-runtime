@@ -738,6 +738,9 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("isolated task runner", rendered)
         self.assertIn("body of one async task", rendered)
         self.assertIn("every facade argument by keyword", rendered)
+        self.assertIn("only the ephemeral runner", rendered)
+        self.assertIn("interpreted by the host, not inside the runner", rendered)
+        self.assertIn("never runner paths such as `/workspace`", rendered)
         self.assertIn("`return` and a JSON value", rendered)
         self.assertLess(
             rendered.index(
@@ -1016,6 +1019,79 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
             ),
             1,
         )
+
+        retry_context = {
+            "_corax_prompt_context": {
+                **failure_context["_corax_prompt_context"],
+                "final_response_retry": True,
+            }
+        }
+        retry = await self.runtime.build(
+            {"history": [], "turn_messages": extended},
+            context=retry_context,
+        )
+        self.assertEqual(
+            retry["messages"][: len(second["messages"])],
+            second["messages"],
+        )
+        self.assertEqual(
+            retry["metadata"]["hidden_envelopes"][-1]["kind"],
+            "final_response_retry",
+        )
+        self.assertIn("no user-visible answer", retry["messages"][-1]["content"])
+        self.assertEqual(
+            retry["metadata"]["static_hash"],
+            first["metadata"]["static_hash"],
+        )
+
+        retry_repeated = await self.runtime.build(
+            {"history": [], "turn_messages": extended},
+            context=retry_context,
+        )
+        self.assertEqual(retry_repeated["messages"], retry["messages"])
+        self.assertEqual(
+            sum(
+                layer["id"] == "behavior.final-response-retry"
+                for layer in retry_repeated["metadata"]["layers"]
+            ),
+            1,
+        )
+
+    async def test_final_response_retry_is_dynamic_on_first_build(self) -> None:
+        turn = [{"role": "user", "content": "Finish."}]
+        baseline = await self.runtime.build(
+            {"turn_messages": turn},
+            context={
+                "_corax_prompt_context": {
+                    "session_id": "first-build-baseline",
+                    "turn_id": "turn-1",
+                }
+            },
+        )
+        payload = {
+            "turn_messages": turn,
+            "final_response_retry": True,
+        }
+        context = {
+            "_corax_prompt_context": {
+                "session_id": "first-build-retry",
+                "turn_id": "turn-1",
+                "final_response_retry": True,
+            }
+        }
+        result = await self.runtime.build(payload, context=context)
+        layer = next(
+            item
+            for item in result["metadata"]["layers"]
+            if item["id"] == "behavior.final-response-retry"
+        )
+        self.assertTrue(layer["dynamic"])
+        self.assertIn("no user-visible answer", str(result["messages"]))
+        self.assertEqual(
+            result["metadata"]["static_hash"],
+            baseline["metadata"]["static_hash"],
+        )
+        self.assertEqual(result["messages"][0], baseline["messages"][0])
 
     async def test_provider_compaction_becomes_next_ram_prefix(self) -> None:
         raw_history = [
