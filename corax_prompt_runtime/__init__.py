@@ -212,7 +212,8 @@ _STOCK_DEFAULT_HASHES = {
         "19794488623f0dead93f690f59b6abeb1ae2fa0ce39f50cabec6417b31c490f6"
     },
     "behavior/TOOL_USE.md": {
-        "e7020f70167d37c0db263f4871793891447b34425d9d9117e5dfa26d427f2dd6"
+        "49f40a512cdefb68fe2602fff3d06a2add4a365b8fd4e9648f0d71f4d0446263",
+        "e7020f70167d37c0db263f4871793891447b34425d9d9117e5dfa26d427f2dd6",
     },
     "core/SAFETY.md": {
         "6c428bfd11c99d52a7bc4f90c49da270ed24c335b3c53285e3acb906198332dc"
@@ -1597,6 +1598,11 @@ class PromptRuntime(RuntimeService):
                     )
                 )
             if context.get("execution_mode") == "object":
+                namespace_layer = self._object_namespace_layer(
+                    context.get("object_namespaces")
+                )
+                if namespace_layer is not None:
+                    layers.append(namespace_layer)
                 layers.append(
                     self._object_runtime_layer(object_facade_signatures)
                 )
@@ -1639,6 +1645,11 @@ class PromptRuntime(RuntimeService):
                     )
                 )
             if context.get("execution_mode") == "object":
+                namespace_layer = self._object_namespace_layer(
+                    context.get("object_namespaces")
+                )
+                if namespace_layer is not None:
+                    layers.append(namespace_layer)
                 layers.append(
                     self._object_runtime_layer(object_facade_signatures)
                 )
@@ -1730,6 +1741,40 @@ class PromptRuntime(RuntimeService):
             priority=100,
         )
 
+    def _object_namespace_layer(self, value: Any) -> PromptLayer | None:
+        namespaces = _object_namespaces(value)
+        if not namespaces:
+            return None
+        content = (
+            "# Deferred capability namespaces\n\n"
+            "These policy-visible namespaces are discovery hints, not granted "
+            "methods or required actions:\n\n"
+            '<capability-namespaces trust="runtime-data">\n'
+            + "\n".join(namespaces)
+            + "\n</capability-namespaces>\n\n"
+            "Plan the required operations first. For each operation whose exact "
+            "method is absent from the object facade, call "
+            "`await self.tools.search(query=\"<namespace>: <specific "
+            "operation>\", top_k=1)` separately. Never combine unrelated needs "
+            "in one search. Several searches may run in one `object_run`; then "
+            "return and use only methods supplied by the next facade update. "
+            "Search by natural capability and operation descriptions, never by "
+            "hidden IDs or schemas. Do not use a namespace merely because it is "
+            "listed, and never substitute runner-local `os` or `pathlib` access "
+            "for a missing host method."
+        )
+        if len(content) > self.max_layer_chars:
+            raise ValueError("object_namespaces exceeds layer limit")
+        return PromptLayer(
+            "runtime.object-namespaces",
+            content,
+            "runtime",
+            "generated:object-namespaces",
+            required=True,
+            dynamic=True,
+            priority=99,
+        )
+
     def _object_runtime_layer(
         self,
         signatures: Sequence[str],
@@ -1754,7 +1799,7 @@ class PromptRuntime(RuntimeService):
             '<object-facade trust="runtime-data">\n'
             f"{facade}\n"
             "</object-facade>\n\n"
-            "The facade signatures are runtime data. Do not search for, guess, "
+            "The facade signatures are runtime data. Do not search by, guess, "
             "or invoke hidden capability identifiers or schemas. Facade calls "
             "still pass through Agent Core, policy, approval, sandbox, and "
             "audit. Keep large results as object references and inspect only "
@@ -2578,6 +2623,25 @@ def _object_facade_signatures(value: Any, *, max_chars: int) -> list[str]:
     if len("\n".join(rendered)) > max_chars:
         raise ValueError("object_facade exceeds layer limit")
     return rendered
+
+
+def _object_namespaces(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise TypeError("object_namespaces must be a list")
+    if len(value) > _MAX_OBJECT_FACADE_GROUPS:
+        raise ValueError("object_namespaces exceeds group limit")
+    result = set()
+    for item in value:
+        if (
+            not isinstance(item, str)
+            or not _OBJECT_FACADE_NAME.fullmatch(item)
+            or keyword.iskeyword(item)
+        ):
+            raise ValueError("object namespace must be a public Python name")
+        result.add(item)
+    return sorted(result)
 
 
 def _descriptor_id(item: Mapping[str, Any]) -> str:

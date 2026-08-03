@@ -11,7 +11,9 @@ envelope, never the eternal core system prefix.
 Legacy mode keeps the fixed `tool_search` + `tool_call` provider tool list and
 places selected schemas in the appended envelope. Object mode instead keeps
 the fixed `object_run(code)` tool and appends compact validated Python
-signatures. Newly activated methods arrive in an append-only
+signatures. It also receives a bounded policy-visible namespace directory;
+compound requests discover each missing operation with a separate narrow
+search instead of forcing an unrelated fallback tool. Newly activated methods arrive in an append-only
 `object-facade-update`; existing method bindings and the cached prefix are not
 rewritten. Earlier envelopes remain only in RAM as part of that prefix; the
 newest runtime block governs the newest user turn. Traces expose IDs and
