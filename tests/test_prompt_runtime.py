@@ -739,6 +739,7 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("body of one async task", rendered)
         self.assertIn("every facade argument by keyword", rendered)
         self.assertIn("only the ephemeral runner", rendered)
+        self.assertIn("When a listed `self.files.*` method is present", rendered)
         self.assertIn("interpreted by the host, not inside the runner", rendered)
         self.assertIn("never runner paths such as `/workspace`", rendered)
         self.assertIn("`return` and a JSON value", rendered)
