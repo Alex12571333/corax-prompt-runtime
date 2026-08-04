@@ -742,6 +742,7 @@ class PromptRuntimeTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("every facade argument by keyword", rendered)
         self.assertIn("For each operation whose exact method is absent", rendered)
         self.assertIn("Never combine unrelated needs in one search", rendered)
+        self.assertIn("the host ends that `object_run`", rendered)
         self.assertIn(
             "files\nmail\nweb",
             "\n".join(str(message.get("content", "")) for message in first["messages"]),
